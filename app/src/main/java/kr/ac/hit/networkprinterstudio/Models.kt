@@ -1,5 +1,6 @@
 package kr.ac.hit.networkprinterstudio
 
+import java.io.Serializable
 import java.net.URI
 
 data class PrinterEndpoint(
@@ -9,7 +10,7 @@ data class PrinterEndpoint(
     val secure: Boolean = false,
     val ippMajor: Int = 2,
     val ippMinor: Int = 0,
-) {
+) : Serializable {
     val uri: String get() = "${if (secure) "ipps" else "ipp"}://$host:$port$path"
     val key: String get() = uri
     val ippVersion: String get() = "$ippMajor.$ippMinor"
@@ -74,7 +75,7 @@ data class PrinterRecord(
     val mediaRightMargins: List<Int> = emptyList(),
     val mediaTopMargins: List<Int> = emptyList(),
     val mediaBottomMargins: List<Int> = emptyList(),
-) {
+) : Serializable {
     val supportsPrintJob: Boolean get() = operations.contains(2)
     val supportsPrintUri: Boolean get() = operations.contains(3)
     val supportsValidateJob: Boolean get() = operations.contains(4)
@@ -110,7 +111,7 @@ data class IppAuthChallenge(
         it.equals("Basic", ignoreCase = true) ||
             it.equals("Digest", ignoreCase = true)
     },
-) {
+) : Serializable {
     val label: String
         get() = buildString {
             append(schemes.ifEmpty { listOf("방식 미확인") }.joinToString(" / "))
@@ -126,11 +127,11 @@ data class PreparedDocument(
     val layoutBakedIn: Boolean = true,
 )
 
-data class IppResolution(val x: Int, val y: Int, val units: Int) {
+data class IppResolution(val x: Int, val y: Int, val units: Int) : Serializable {
     val label: String get() = if (x == y) "$x${if (units == 4) "dpcm" else "dpi"}" else "${x}×${y}${if (units == 4) "dpcm" else "dpi"}"
 }
 
-data class IppRange(val lower: Int, val upper: Int)
+data class IppRange(val lower: Int, val upper: Int) : Serializable
 
 data class IppJobOptions(
     val copies: Int = 1,

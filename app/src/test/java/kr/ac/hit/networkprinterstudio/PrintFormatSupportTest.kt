@@ -102,4 +102,32 @@ class PrintFormatSupportTest {
         assertTrue(message.contains("파일 형식을 판별할 수 없고"))
         assertTrue(message.contains("인쇄가 보장되지 않습니다"))
     }
+
+    @Test
+    fun automaticDetectionAndWildcardsNeverSupportAnUnknownSource() {
+        val generic = listOf(PrintFormatSupport.OCTET_STREAM, "application/x-octet-stream", "*/*", "image/*")
+        for (source in generic) {
+            assertEquals(null, PrintFormatSupport.advertisedMime(generic, source))
+            assertEquals(null, PrintFormatSupport.directSubmissionMime(generic, source))
+            assertTrue(!PrintFormatSupport.supports(generic, source))
+        }
+        assertEquals(null, PrintFormatSupport.directSubmissionMime(generic, "image/jpeg"))
+    }
+
+    @Test
+    fun mimeParametersAndImageAliasesPreserveSpecificAdvertisedSupport() {
+        val formats = listOf("image/jpeg", "application/pdf")
+        assertEquals("image/jpeg", PrintFormatSupport.directSubmissionMime(formats, "IMAGE/PJPEG; name=photo.jpg"))
+        assertEquals("application/pdf", PrintFormatSupport.directSubmissionMime(formats, " application/PDF; version=1.7 "))
+    }
+
+    @Test
+    fun unknownFormatExplainsAutomaticDetectionAndSuggestsAnAvailablePdfPath() {
+        val message = PrintFormatSupport.unsupportedFileMessage(
+            "unknown.bin", "application/octet-stream; charset=binary", samsungFormats,
+        )
+        assertTrue(message.startsWith("전송 실패:"))
+        assertTrue(message.contains("자동 형식 감지 광고만으로는"))
+        assertTrue(message.contains("PDF로 변환한 뒤 다시 선택하세요"))
+    }
 }

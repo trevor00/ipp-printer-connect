@@ -17,9 +17,16 @@ data class PrintableAreaInsets(
 
 class PaperPreviewView(
     context: Context,
-    private val pageBitmap: Bitmap,
+    pageBitmap: Bitmap,
     private val printableInsets: PrintableAreaInsets? = null,
 ) : View(context) {
+    private var pageBitmap: Bitmap? = pageBitmap
+
+    fun setPageBitmap(bitmap: Bitmap?) {
+        pageBitmap = bitmap
+        invalidate()
+    }
+
     private val paperPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
         setShadowLayer(dp(10f), 0f, dp(4f), 0x66000000)
@@ -49,6 +56,7 @@ class PaperPreviewView(
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
+        val pageBitmap = pageBitmap ?: return
         if (pageBitmap.isRecycled || width <= 0 || height <= 0) return
         val inset = dp(24f)
         val availableWidth = (width - inset * 2f).coerceAtLeast(1f)

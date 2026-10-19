@@ -9,21 +9,25 @@ import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.pdf.PdfDocument
 import android.graphics.pdf.PdfRenderer
+import android.media.ExifInterface
 import android.os.ParcelFileDescriptor
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.math.BigDecimal
+import java.math.RoundingMode
 import kotlin.math.ceil
 import kotlin.math.sqrt
 
 enum class ContentHorizontal { LEFT, CENTER, RIGHT }
 enum class ContentVertical { TOP, CENTER, BOTTOM }
-enum class ContentScale { FIT, FILL, FULL_BLEED_FILL, PRINTABLE_FIT, ACTUAL }
+enum class ContentScale { FIT, FILL, FULL_BLEED_FILL, PRINTABLE_FIT, ACTUAL, SHRINK_ONLY }
 
 data class ContentLayoutOptions(
     val horizontal: ContentHorizontal = ContentHorizontal.CENTER,
     val vertical: ContentVertical = ContentVertical.CENTER,
     val scale: ContentScale = ContentScale.FIT,
     val margin: Int = 43,
-    val textSize: Float = 15f,
     val rasterDpi: Int = 150,
     val postScriptJpegQuality: Int? = 90,
     val pageWidth: Int = 595,
@@ -41,6 +45,7 @@ data class ContentLayoutOptions(
 data class RenderedPreview(val bitmap: Bitmap, val pageIndex: Int, val pageCount: Int)
 
 object DocumentRenderer {
+    private const val DEFAULT_TEXT_SIZE_PT = 15f
     // Print bitmaps use the user's exact DPI. Allocation failure never triggers lower-quality retry.
     private fun printBitmap(widthPoints: Int, heightPoints: Int, scale: Float): Bitmap {
         val (width, height) = RenderQuality.pixelDimensions(widthPoints, heightPoints, scale)
@@ -68,6 +73,7 @@ object DocumentRenderer {
             ContentScale.FILL, ContentScale.FULL_BLEED_FILL ->
                 maxOf(availableWidth / sourceWidth, availableHeight / sourceHeight)
             ContentScale.ACTUAL -> 1f
+            ContentScale.SHRINK_ONLY -> minOf(1f, availableWidth / sourceWidth, availableHeight / sourceHeight)
             else -> minOf(availableWidth / sourceWidth, availableHeight / sourceHeight)
         }
         return fit * options.scalePercent / 100f * options.rasterDpi / 72f
@@ -106,6 +112,9 @@ object DocumentRenderer {
         try {
             PdfRenderer(descriptor).use { renderer ->
                 require(renderer.pageCount > 0) { "PDF에 출력할 페이지가 없습니다" }
+                require(pageRanges.all { it.lower >= 1 && it.upper >= it.lower && it.upper <= renderer.pageCount }) {
+                    "페이지 범위가 PDF의 전체 ${renderer.pageCount}페이지를 벗어납니다"
+                }
                 val sourceIndices = if (pageRanges.isEmpty()) {
                     (0 until renderer.pageCount).toList()
                 } else {
@@ -121,6 +130,27 @@ object DocumentRenderer {
                 val cellWidth = (pageWidth - gap * (columns + 1)) / columns
                 val cellHeight = (pageHeight - gap * (rows + 1)) / rows
                 sourceIndices.chunked(perSheet).forEachIndexed { sheetIndex, indices ->
+                    if (perSheet == 1) {
+                        renderer.openPage(indices.single()).use { source ->
+                            val target = outputPdf.startPage(
+                                PdfDocument.PageInfo.Builder(source.width, source.height, sheetIndex + 1).create(),
+                            )
+                            try {
+                                target.canvas.drawColor(Color.WHITE)
+                                withPdfPageBitmap(source, rasterDpi / 72f) { bitmap ->
+                                    target.canvas.drawBitmap(
+                                        bitmap,
+                                        null,
+                                        RectF(0f, 0f, source.width.toFloat(), source.height.toFloat()),
+                                        Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG),
+                                    )
+                                }
+                            } finally {
+                                outputPdf.finishPage(target)
+                            }
+                        }
+                        return@forEachIndexed
+                    }
                     val target = outputPdf.startPage(PdfDocument.PageInfo.Builder(pageWidth, pageHeight, sheetIndex + 1).create())
                     target.canvas.drawColor(Color.WHITE)
                     indices.forEachIndexed { cellIndex, sourceIndex ->
@@ -165,32 +195,43 @@ object DocumentRenderer {
         orientation: Int? = null,
         maxWidth: Int = 900,
     ): RenderedPreview {
-        PdfRenderer(descriptor).use { renderer ->
-            require(renderer.pageCount > 0) { "PDF에 미리 볼 페이지가 없습니다" }
-            require(pageIndex in 0 until renderer.pageCount) {
-                "선택한 ${pageIndex + 1}페이지가 PDF의 전체 ${renderer.pageCount}페이지를 벗어납니다"
-            }
-            renderer.openPage(pageIndex).use { page ->
-                val scale = minOf(maxWidth.toFloat() / page.width, 2f)
-                val rendered = Bitmap.createBitmap(
-                    (page.width * scale).toInt().coerceAtLeast(1),
-                    (page.height * scale).toInt().coerceAtLeast(1),
-                    Bitmap.Config.ARGB_8888,
-                )
-                android.graphics.Canvas(rendered).drawColor(Color.WHITE)
-                page.render(rendered, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                val degrees = when (orientation) {
-                    4 -> 90f
-                    5 -> 270f
-                    6 -> 180f
-                    else -> 0f
+        var ownedBitmap: Bitmap? = null
+        return try {
+            val preview = PdfRenderer(descriptor).use { renderer ->
+                require(renderer.pageCount > 0) { "PDF에 미리 볼 페이지가 없습니다" }
+                require(pageIndex in 0 until renderer.pageCount) {
+                    "선택한 ${pageIndex + 1}페이지가 PDF의 전체 ${renderer.pageCount}페이지를 벗어납니다"
                 }
-                val result = if (degrees == 0f) rendered else {
-                    Bitmap.createBitmap(rendered, 0, 0, rendered.width, rendered.height, Matrix().apply { postRotate(degrees) }, true)
-                        .also { rendered.recycle() }
+                renderer.openPage(pageIndex).use { page ->
+                    val scale = minOf(maxWidth.toFloat() / page.width, 2f)
+                    val rendered = Bitmap.createBitmap(
+                        (page.width * scale).toInt().coerceAtLeast(1),
+                        (page.height * scale).toInt().coerceAtLeast(1),
+                        Bitmap.Config.ARGB_8888,
+                    )
+                    ownedBitmap = rendered
+                    android.graphics.Canvas(rendered).drawColor(Color.WHITE)
+                    page.render(rendered, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                    val degrees = when (orientation) {
+                        4 -> 90f
+                        5 -> 270f
+                        6 -> 180f
+                        else -> 0f
+                    }
+                    val result = if (degrees == 0f) rendered else {
+                        Bitmap.createBitmap(rendered, 0, 0, rendered.width, rendered.height, Matrix().apply { postRotate(degrees) }, true)
+                            .also {
+                                ownedBitmap = it
+                                if (it !== rendered) rendered.recycle()
+                            }
+                    }
+                    RenderedPreview(result, pageIndex, renderer.pageCount)
                 }
-                return RenderedPreview(result, pageIndex, renderer.pageCount)
             }
+            ownedBitmap = null
+            preview
+        } finally {
+            ownedBitmap?.recycle()
         }
     }
 
@@ -252,7 +293,7 @@ object DocumentRenderer {
                             val targetPage = outputPdf.startPage(PdfDocument.PageInfo.Builder(options.pageWidth, options.pageHeight, index + 1).create())
                             targetPage.canvas.drawColor(Color.WHITE)
                             drawRotatedPositionedBitmap(targetPage.canvas, bitmap,
-                                if (options.scale == ContentScale.ACTUAL) options.copy(scalePercent = options.scalePercent / renderScale) else options)
+                                pdfPlacementOptions(sourcePage.width, sourcePage.height, renderScale, options))
                             outputPdf.finishPage(targetPage)
                         } finally {
                             bitmap.recycle()
@@ -302,13 +343,81 @@ object DocumentRenderer {
     fun textUrf(title: String, text: String, options: ContentLayoutOptions): ByteArray =
         urfDocument(options) { emit -> withTextPage(title, text, options, emit) }
 
-    private fun postScriptDocument(options: ContentLayoutOptions, render: (((Bitmap) -> Unit) -> Unit)): ByteArray {
+    /** Encodes final PDF pages without applying any content layout a second time. */
+    fun encodeLaidOutPdf(
+        descriptor: ParcelFileDescriptor,
+        mime: String,
+        options: ContentLayoutOptions,
+    ): ByteArray {
+        val outputMime = PrintFormatSupport.normalize(mime)
+        require(outputMime in setOf(PrintFormatSupport.POSTSCRIPT, PrintFormatSupport.PWG_RASTER, PrintFormatSupport.URF, PrintFormatSupport.PCL, "image/jpeg", "image/png")) {
+            "배치한 PDF를 $mime 형식으로 변환할 수 없습니다"
+        }
+        PdfRenderer(descriptor).use { renderer ->
+            require(renderer.pageCount > 0) { "PDF에 출력할 페이지가 없습니다" }
+            if (outputMime == "image/jpeg" || outputMime == "image/png") {
+                require(renderer.pageCount == 1) {
+                    "전송 실패: 배치한 문서는 ${renderer.pageCount}페이지이지만 $mime 파일에는 한 페이지만 저장할 수 있습니다. " +
+                        "여러 페이지를 지원하는 PDF, PostScript 또는 Raster 출력 형식이 필요합니다."
+                }
+                val quality = if (outputMime == "image/jpeg") {
+                    options.postScriptJpegQuality ?: error(
+                        "전송 실패: 프린터가 지원하는 JPEG에는 무손실 RGB 설정을 적용할 수 없습니다. " +
+                            "이미지 저장 품질에서 JPEG 품질 90 또는 100을 선택해 주세요.",
+                    )
+                } else 100
+                require(quality in 0..100) { "JPEG 품질은 0~100이어야 합니다" }
+                return renderer.openPage(0).use { source ->
+                    ByteArrayOutputStream().use { output ->
+                        withPdfPageBitmap(source, options.rasterDpi / 72f) { bitmap ->
+                            val format = if (outputMime == "image/jpeg") Bitmap.CompressFormat.JPEG else Bitmap.CompressFormat.PNG
+                            check(bitmap.compress(format, quality, output)) { "배치한 문서의 이미지 변환에 실패했습니다" }
+                        }
+                        ImagePrintDensity.withDpi(output.toByteArray(), outputMime, options.rasterDpi)
+                    }
+                }
+            }
+            var currentPageSize = options.pageWidth to options.pageHeight
+            val render: ((Bitmap) -> Unit) -> Unit = { emit ->
+                for (index in 0 until renderer.pageCount) {
+                    renderer.openPage(index).use { source ->
+                        currentPageSize = source.width to source.height
+                        withPdfPageBitmap(source, options.rasterDpi / 72f, emit)
+                    }
+                }
+            }
+            return when (outputMime) {
+                PrintFormatSupport.POSTSCRIPT -> postScriptDocument(options, { currentPageSize }, render)
+                PrintFormatSupport.PWG_RASTER -> pwgRasterDocument(options, { currentPageSize }, render)
+                PrintFormatSupport.URF -> urfDocument(options, render)
+                else -> pclDocument(options, render)
+            }
+        }
+    }
+
+    private fun withPdfPageBitmap(source: PdfRenderer.Page, renderScale: Float, emit: (Bitmap) -> Unit) {
+        val bitmap = printBitmap(source.width, source.height, renderScale)
+        try {
+            Canvas(bitmap).drawColor(Color.WHITE)
+            source.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
+            emit(bitmap)
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    private fun postScriptDocument(
+        options: ContentLayoutOptions,
+        pageSize: () -> Pair<Int, Int> = { options.pageWidth to options.pageHeight },
+        render: (((Bitmap) -> Unit) -> Unit),
+    ): ByteArray {
         val output = ByteArrayOutputStream()
         output.writeAscii("%!PS-Adobe-3.0\n%%Creator: IPP Printer Connect\n%%LanguageLevel: 2\n%%Pages: (atend)\n%%EndComments\n")
         var pageCount = 0
         render { bitmap ->
             pageCount += 1
-            writePostScriptPage(output, bitmap, pageCount, options.pageWidth, options.pageHeight, options.postScriptJpegQuality)
+            val (pageWidth, pageHeight) = pageSize()
+            writePostScriptPage(output, bitmap, pageCount, pageWidth, pageHeight, options.postScriptJpegQuality)
         }
         output.writeAscii("%%Trailer\n%%Pages: $pageCount\n%%EOF\n")
         return output.toByteArray()
@@ -325,12 +434,14 @@ object DocumentRenderer {
 
     private fun pwgRasterDocument(
         options: ContentLayoutOptions,
+        pageSize: () -> Pair<Int, Int> = { options.pageWidth to options.pageHeight },
         render: (((Bitmap) -> Unit) -> Unit),
     ): ByteArray {
         val output = ByteArrayOutputStream()
         output.writeAscii("RaS2")
         render { bitmap ->
-            output.write(pwgPageHeader(bitmap, options))
+            val (pageWidth, pageHeight) = pageSize()
+            output.write(pwgPageHeader(bitmap, options.copy(pageWidth = pageWidth, pageHeight = pageHeight)))
             writePackBitsRgbRows(output, bitmap)
         }
         return output.toByteArray()
@@ -399,8 +510,26 @@ object DocumentRenderer {
         output.write(ByteArray(16 * 64))
         output.writeFixedString("")
         output.writeFixedString("Perceptual")
-        output.writeFixedString("iso_a4_210x297mm")
+        output.writeFixedString(pwgMediaSizeName(options.pageWidth, options.pageHeight))
         return output.toByteArray().also { check(it.size == 1796) { "PWG Raster 페이지 헤더 크기가 올바르지 않습니다" } }
+    }
+
+    private fun pwgMediaSizeName(widthPoints: Int, heightPoints: Int): String {
+        val standardName = when (widthPoints to heightPoints) {
+            595 to 842 -> "iso_a4_210x297mm"
+            842 to 1191 -> "iso_a3_297x420mm"
+            420 to 595 -> "iso_a5_148x210mm"
+            612 to 792 -> "na_letter_8.5x11in"
+            612 to 1008 -> "na_legal_8.5x14in"
+            else -> null
+        }
+        if (standardName != null) return standardName
+        fun millimeters(points: Int): String = BigDecimal.valueOf(points.toLong())
+            .multiply(BigDecimal("25.4"))
+            .divide(BigDecimal("72"), 4, RoundingMode.HALF_UP)
+            .stripTrailingZeros()
+            .toPlainString()
+        return "custom_document_${millimeters(widthPoints)}x${millimeters(heightPoints)}mm"
     }
 
     private fun writePackBitsRgbRows(output: ByteArrayOutputStream, bitmap: Bitmap) {
@@ -484,7 +613,7 @@ object DocumentRenderer {
                         Canvas(source).drawColor(Color.WHITE)
                         sourcePage.render(source, null, null, PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
                         withPositionedPage(source,
-                            if (options.scale == ContentScale.ACTUAL) options.copy(scalePercent = options.scalePercent / renderScale) else options, emit)
+                            pdfPlacementOptions(sourcePage.width, sourcePage.height, renderScale, options), emit)
                     } finally {
                         source.recycle()
                     }
@@ -493,19 +622,54 @@ object DocumentRenderer {
         }
     }
 
+    private fun pdfPlacementOptions(width: Int, height: Int, renderScale: Float, options: ContentLayoutOptions): ContentLayoutOptions = when (options.scale) {
+        ContentScale.ACTUAL -> options.copy(scalePercent = options.scalePercent / renderScale)
+        ContentScale.SHRINK_ONLY -> options.copy(
+            scale = ContentScale.ACTUAL,
+            scalePercent = sourceRenderScale(width, height, options.copy(rasterDpi = 72)) * 100f / renderScale,
+        )
+        else -> options
+    }
+
     private fun decodeOriginalImage(image: ByteArray, width: Int, height: Int): Bitmap {
         val requiredBytes = width.toLong() * height * 4
         val runtime = Runtime.getRuntime()
         require(requiredBytes <= runtime.maxMemory() - (runtime.totalMemory() - runtime.freeMemory())) {
             "원본 사진을 읽을 메모리가 부족합니다. 사진 크기를 직접 줄여 다시 선택해 주세요. 자동 축소하지 않았습니다."
         }
-        return try {
+        val orientation = try {
+            ByteArrayInputStream(image).use { stream ->
+                ExifInterface(stream).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+            }
+        } catch (_: IOException) {
+            ExifInterface.ORIENTATION_NORMAL
+        } catch (_: OutOfMemoryError) {
+            error("사진 방향 정보를 읽을 메모리가 부족합니다. 자동 축소하지 않았습니다.")
+        }
+        val bitmap = try {
             BitmapFactory.decodeByteArray(image, 0, image.size, BitmapFactory.Options().apply {
                 inSampleSize = 1
                 inScaled = false
             }) ?: error("이미지를 읽을 수 없습니다")
         } catch (_: OutOfMemoryError) {
             error("원본 사진을 읽을 메모리가 부족합니다. 자동 축소하지 않았습니다.")
+        }
+        val matrixValues = ImageOrientation.matrixValues(orientation, bitmap.width, bitmap.height) ?: return bitmap
+        var oriented: Bitmap? = null
+        try {
+            val availableBytes = runtime.maxMemory() - (runtime.totalMemory() - runtime.freeMemory())
+            require(bitmap.allocationByteCount.toLong() <= availableBytes) {
+                "사진 방향을 보정할 메모리가 부족합니다. 사진 크기를 직접 줄여 다시 선택해 주세요. 자동 축소하지 않았습니다."
+            }
+            oriented = Bitmap.createBitmap(
+                bitmap, 0, 0, bitmap.width, bitmap.height,
+                Matrix().apply { setValues(matrixValues) }, false,
+            )
+            return oriented
+        } catch (_: OutOfMemoryError) {
+            error("사진 방향을 보정할 메모리가 부족합니다. 자동 축소하지 않았습니다.")
+        } finally {
+            if (oriented !== bitmap) bitmap.recycle()
         }
     }
 
@@ -565,7 +729,7 @@ object DocumentRenderer {
 
     private fun textPages(title: String, text: String, options: ContentLayoutOptions): List<List<String>> {
         require(text.isNotBlank()) { "출력할 텍스트가 비어 있습니다" }
-        val size = options.textSize * options.scalePercent / 100f
+        val size = DEFAULT_TEXT_SIZE_PT * options.scalePercent / 100f
         require(size.isFinite() && size > 0) { "글자 크기는 0보다 커야 합니다." }
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { textSize = size }
         val insets = layoutInsets(options)
@@ -581,7 +745,7 @@ object DocumentRenderer {
     }
 
     private fun drawTextPage(canvas: Canvas, title: String, lines: List<String>, options: ContentLayoutOptions) {
-        val effectiveTextSize = options.textSize * options.scalePercent / 100f
+        val effectiveTextSize = DEFAULT_TEXT_SIZE_PT * options.scalePercent / 100f
         val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.BLACK; textSize = effectiveTextSize * 1.35f }
         val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.BLACK; textSize = effectiveTextSize }
         val insets = layoutInsets(options)
@@ -731,6 +895,7 @@ object DocumentRenderer {
                 maxOf(availableWidth / bitmap.width, availableHeight / bitmap.height)
             ContentScale.PRINTABLE_FIT -> minOf(availableWidth / bitmap.width, availableHeight / bitmap.height)
             ContentScale.ACTUAL -> 1f
+            ContentScale.SHRINK_ONLY -> PrintLayoutSupport.fitScale(bitmap.width.toFloat(), bitmap.height.toFloat(), availableWidth, availableHeight, shrinkOnly = true)
         }
         val scale = baseScale * options.scalePercent / 100f
         val width = bitmap.width * scale

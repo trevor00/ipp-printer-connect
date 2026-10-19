@@ -17,7 +17,6 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.LinkProperties
 import android.net.Uri
-import android.provider.OpenableColumns
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -35,13 +34,28 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.*
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
     private lateinit var discovery: PrinterDiscovery
     private val main = Handler(Looper.getMainLooper())
     private val io = Executors.newSingleThreadExecutor()
+    private var previewGeneration = 0
+    private var activePreviewDialog: android.app.AlertDialog? = null
+    private val printGate get() = PrintWorkManager.gate
+    private val printObserverOwner = Any()
+    private val filePreparer by lazy { FileDocumentPreparer(applicationContext) }
+    private var recreatingUi = false
+    private var selectedFileMime: String? = null
+    private var documentInspectionGeneration = 0
+    private var restoringEditor = false
+    private lateinit var pageHandlingLabel: TextView
+    private lateinit var mainScroll: ScrollView
+    private val expandablePanels = linkedMapOf<String, Pair<View, TextView>>()
+    private var activePrintNameInput: EditText? = null
+    private var pendingPrinterAlias: String? = null
+    private var activePrintDialog: android.app.AlertDialog? = null
+    private lateinit var printButton: Button
     private val printers = mutableListOf<PrinterRecord>()
     private val visiblePrinters = mutableListOf<PrinterRecord>()
     private val savedPrinters = mutableListOf<PrinterRecord>()
@@ -117,8 +131,6 @@ class MainActivity : Activity() {
     private lateinit var contentMarginSpinner: Spinner
     private lateinit var contentMarginDetailLabel: TextView
     private var contentMarginValues: List<Int> = listOf(0, 20, 43, 77)
-    private lateinit var contentTextSizeInput: EditText
-    private lateinit var applyTextStyle: CheckBox
     private lateinit var rasterDpiSpinner: Spinner
     private lateinit var psEncodingSpinner: Spinner
     private lateinit var contentScalePercentInput: EditText
@@ -150,7 +162,16 @@ class MainActivity : Activity() {
         if (!restoredEgress.isNullOrBlank() && !restoredPrefix.isNullOrBlank()) {
             displayBgpScope(BgpScope(restoredEgress, restoredPrefix))
         }
+        restoreEditorState(savedInstanceState?.getBundle(STATE_EDITOR) ?: retainedEditorState)
+        if (savedInstanceState?.getBoolean(STATE_PRINT_WAS_ACTIVE) == true && PrintWorkManager.state == null) {
+            updateStatus("앱 종료 전 인쇄 요청의 결과를 확인할 수 없습니다. 프린터에서 출력 여부를 확인한 뒤 다시 인쇄하세요.", StatusTone.NEUTRAL)
+        }
         startNetworkMonitoring()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        PrintWorkManager.observe(printObserverOwner, ::renderPrintWork)
     }
 
     private fun buildUi() {
@@ -163,6 +184,7 @@ class MainActivity : Activity() {
             requestFocus()
         }
         installAdaptiveInsets(scroll)
+        mainScroll = scroll
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(0, dp(6), 0, dp(28))
@@ -440,6 +462,8 @@ class MainActivity : Activity() {
             inputType = android.text.InputType.TYPE_CLASS_NUMBER
         }
         pageRangesInput = addTextOptionRow(advancedPrintSettings, "페이지 범위", "예: 1-3,5")
+        pageHandlingLabel = TextView(this).apply { textSize = 12f; setTextColor(muted); setPadding(dp(2), dp(5), dp(2), dp(8)) }
+        advancedPrintSettings.addView(pageHandlingLabel)
         setSubmissionMethodOptions(null)
         setColorModeOptions(null)
         setMediaOptions(null)
@@ -465,30 +489,13 @@ class MainActivity : Activity() {
         fileRow.addView(fileLabel, LinearLayout.LayoutParams(0, -2, 1f))
         clearFileButton = button("지우기") {
             selectedFile = null
+            selectedFileMime = null
+            documentInspectionGeneration += 1
             fileLabel.text = "선택한 파일이 없습니다"
             updateDocumentInputAvailability()
         }
         fileRow.addView(clearFileButton)
         documentCard.addView(fileRow, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8); bottomMargin = dp(16) })
-        applyTextStyle = CheckBox(this).apply {
-            text = "텍스트 파일 글자 크기·배치 적용 (문서로 변환)"
-            setTextColor(ink)
-            buttonTintList = ColorStateList.valueOf(accent)
-        }
-        documentCard.addView(applyTextStyle)
-        contentTextSizeInput = addTextOptionRow(documentCard, "인쇄 글자 크기 (pt)", "예: 15 또는 24").apply {
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
-            setText("15")
-            isEnabled = false
-        }
-        applyTextStyle.setOnCheckedChangeListener { _, checked -> contentTextSizeInput.isEnabled = checked }
-        documentCard.addView(TextView(this).apply {
-            text = "선택한 TXT 등 일반 텍스트 파일에 적용합니다. 체크하면 PDF 또는 지원되는 인쇄 언어로 변환합니다. " +
-                "변환할 때 긴 글은 글자 크기를 줄이지 않고 다음 페이지로 이어집니다. " +
-                "체크하지 않고 원문을 보내면 글자 크기는 프린터가 정합니다. pt는 배율 100% 기준이며 방향·배율에 따라 실제 크기가 달라질 수 있습니다."
-            textSize = 12f
-            setTextColor(muted)
-        })
         forcePostScript = CheckBox(this).apply {
             text = "현재 문서를 PostScript로 변환하여 전송"
             textSize = 13f
@@ -572,13 +579,14 @@ class MainActivity : Activity() {
             layoutSettings, "앱 변환 해상도 (dpi)", listOf("75 dpi", "150 dpi", "300 dpi", "600 dpi", "1200 dpi"), 1,
         )
         psEncodingSpinner = addFixedSpinnerRow(
-            layoutSettings, "PostScript 이미지 저장", listOf("JPEG 품질 90", "JPEG 품질 100 (손실 압축)", "무손실 RGB (파일 큼)"), 0,
+            layoutSettings, "이미지 저장 품질 (PostScript·JPEG)", listOf("JPEG 품질 90", "JPEG 품질 100 (손실 압축)", "무손실 RGB (파일 큼)"), 0,
         )
         layoutSettings.addView(TextView(this).apply {
             text = "변환이 필요할 때 선택한 해상도로 생성하며 자동으로 낮추지 않습니다. " +
                 "고해상도는 메모리·시간·파일 크기가 늘어납니다. 원본 전송·문서 URL에는 적용되지 않습니다. " +
                 "프린터 인쇄 해상도는 고급 IPP 설정에서 별도로 선택하세요.\n" +
                 "현재 PCL 변환은 흑백만 지원하며 1200 dpi는 지원하지 않습니다. " +
+                "JPEG로 변환할 때도 위 저장 품질을 사용하며 JPEG는 무손실 저장을 지원하지 않습니다. " +
                 "파일 전송 한도는 50 MiB이며 초과 시 축소하지 않고 실패를 안내합니다."
             textSize = 12f
             setTextColor(muted)
@@ -604,6 +612,13 @@ class MainActivity : Activity() {
             buttonTintList = ColorStateList.valueOf(accent)
         }
         layoutSettings.addView(applyLayoutToPdf)
+        layoutSettings.addView(TextView(this).apply {
+            text = "여백·방향·배율·위치·페이지 선택을 바꾸면 파일의 원본 지원 여부와 관계없이 배치를 적용해 전송합니다. " +
+                "PDF 체크를 해제해도 변경한 배치 설정은 적용합니다. 고급 IPP 배율·위치를 선택하면 해당 값을 사용합니다."
+            textSize = 12f
+            setTextColor(muted)
+            setPadding(dp(2), dp(6), dp(2), dp(8))
+        })
         authorized = CheckBox(this).apply {
             text = "이 프린터로 출력하는 것을 확인했습니다"
             textSize = 13f
@@ -613,7 +628,8 @@ class MainActivity : Activity() {
         }
         val finalActions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         finalActions.addView(button("미리보기") { showPrintPreview() }, LinearLayout.LayoutParams(0, -2, 1f))
-        finalActions.addView(button("인쇄하기", primary = true) { validateAndPrint() }, LinearLayout.LayoutParams(0, -2, 1.35f).apply { marginStart = dp(8) })
+        printButton = button("인쇄하기", primary = true) { validateAndPrint() }
+        finalActions.addView(printButton, LinearLayout.LayoutParams(0, -2, 1.35f).apply { marginStart = dp(8) })
 
         addSection(root, documentCard)
 
@@ -804,6 +820,7 @@ class MainActivity : Activity() {
     }
 
     private fun expander(label: String, target: View) = TextView(this).apply {
+        expandablePanels[label] = target to this
         text = "$label  ＋"
         textSize = 13f
         gravity = Gravity.CENTER_VERTICAL
@@ -1121,6 +1138,8 @@ class MainActivity : Activity() {
         }
         selected = printer.takeIf { it.available }
         selectedFile = null
+        selectedFileMime = null
+        documentInspectionGeneration += 1
         fileLabel.text = "선택한 파일이 없습니다"
         showSelectedPrinter(printer)
         val selectedIndex = visiblePrinters.indexOfFirst {
@@ -1565,16 +1584,18 @@ class MainActivity : Activity() {
         refreshSavedPrinterCards()
     }
 
-    private fun printAfterSavingPrinter(printer: PrinterRecord) {
+    private fun printAfterSavingPrinter(request: PrintWorkRequest, requestId: Long) {
+        if (!printGate.isActive(requestId)) return
+        val printer = request.printer
         if (savedPrinters.any { it.endpoint.key == printer.endpoint.key }) {
             rememberPrintedPrinter(printer)
-            sendOneJob(printer)
+            sendOneJob(requestId)
             return
         }
         val suggestedName = suggestedPrinterName(printer)
         val input = EditText(this).apply {
             hint = "예: 우리집 프린터"
-            setText(suggestedName)
+            setText(pendingPrinterAlias ?: suggestedName)
             setSingleLine()
             selectAll()
             styleInput()
@@ -1590,14 +1611,27 @@ class MainActivity : Activity() {
             })
             addView(input, LinearLayout.LayoutParams(-1, dp(52)))
         }
+        activePrintNameInput = input
+        var submitted = false
+        setPrintPhase(requestId, "이름 설정 중")
         val dialog = android.app.AlertDialog.Builder(this)
             .setTitle("프린터 이름 설정")
             .setView(container)
             .setNegativeButton("취소", null)
             .setPositiveButton("저장 후 인쇄", null)
             .create()
+        activePrintDialog = dialog
+        dialog.setOnDismissListener {
+            if (activePrintDialog === dialog) activePrintDialog = null
+            activePrintNameInput = null
+            if (!submitted && !recreatingUi) {
+                pendingPrinterAlias = null
+                finishPrintRequest(requestId)
+            }
+        }
         dialog.setOnShowListener {
             dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                if (submitted || !printGate.isActive(requestId)) return@setOnClickListener
                 val name = input.text.toString().trim()
                 if (name.isBlank()) {
                     input.error = "저장할 프린터 이름을 입력하세요"
@@ -1605,8 +1639,10 @@ class MainActivity : Activity() {
                 }
                 savedPrinterAliases[printer.endpoint.key] = name.take(80)
                 rememberPrintedPrinter(printer)
+                pendingPrinterAlias = null
+                submitted = true
                 dialog.dismiss()
-                sendOneJob(printer)
+                sendOneJob(requestId)
             }
             input.requestFocus()
             dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE)
@@ -1936,6 +1972,7 @@ class MainActivity : Activity() {
     private fun showPrinterAuthDialog(
         printer: PrinterRecord,
         challengeOverride: IppAuthChallenge? = null,
+        onCancelled: (() -> Unit)? = null,
         onCredentialsReady: (() -> Unit)? = null,
     ) {
         val endpoint = printer.endpoint
@@ -1990,6 +2027,7 @@ class MainActivity : Activity() {
         )
         container.addView(preemptiveBasic)
 
+        var credentialsHandedOff = false
         val dialog = android.app.AlertDialog.Builder(this)
             .setTitle("IPP 프린터 로그인")
             .setView(container)
@@ -1997,6 +2035,11 @@ class MainActivity : Activity() {
             .setNegativeButton("취소", null)
             .setNeutralButton("인증 삭제", null)
             .create()
+        if (onCancelled != null) activePrintDialog = dialog
+        dialog.setOnDismissListener {
+            if (activePrintDialog === dialog) activePrintDialog = null
+            if (!credentialsHandedOff && !recreatingUi) onCancelled?.invoke()
+        }
         dialog.setOnShowListener {
             val positive = dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE)
             positive.isEnabled = !unsupportedKnownScheme
@@ -2005,11 +2048,12 @@ class MainActivity : Activity() {
                 setOnClickListener {
                     IppClient.clearCredentials(endpoint)
                     updateStatus("${endpoint.host}의 저장된 인증 정보를 삭제했습니다", StatusTone.NEUTRAL)
-                    if (printer.available) showSelectedPrinter(printer)
+                    if (printer.available) updatePrinterAuthButton(printer)
                     dialog.dismiss()
                 }
             }
             positive.setOnClickListener {
+                if (credentialsHandedOff || !dialog.isShowing) return@setOnClickListener
                 val user = username.text.toString().trim()
                 if (user.isEmpty()) {
                     username.error = "사용자 이름을 입력하세요"
@@ -2028,7 +2072,8 @@ class MainActivity : Activity() {
                         "${endpoint.host}의 인증 정보를 저장했습니다. 다음 IPP 요청에서 확인합니다.",
                         StatusTone.SUCCESS,
                     )
-                    showSelectedPrinter(printer)
+                    updatePrinterAuthButton(printer)
+                    credentialsHandedOff = true
                     dialog.dismiss()
                     onCredentialsReady?.invoke()
                     return@setOnClickListener
@@ -2044,6 +2089,7 @@ class MainActivity : Activity() {
                         IppClient.getPrinterAttributes(endpoint, 5_000)
                     }.getOrNull()
                     main.post {
+                        if (!dialog.isShowing || isFinishing || isDestroyed) return@post
                         if (authenticated != null) {
                             val updated = authenticated.copy(
                                 source = "${printer.source}-authenticated",
@@ -2055,6 +2101,7 @@ class MainActivity : Activity() {
                                 "${endpoint.host} 로그인 성공 · IPP ${updated.endpoint.ippVersion}",
                                 StatusTone.SUCCESS,
                             )
+                            credentialsHandedOff = true
                             dialog.dismiss()
                             onCredentialsReady?.invoke()
                         } else {
@@ -2105,13 +2152,7 @@ class MainActivity : Activity() {
             if (printer.location.isNotBlank()) append(" · 위치 ${printer.location}")
             append("\n${printer.endpoint.uri}")
         }
-        printerAuthButton.visibility = View.VISIBLE
-        printerAuthButton.text = if (IppClient.hasCredentials(printer.endpoint)) {
-            "프린터 로그인 변경 / 삭제"
-        } else {
-            "프린터 로그인 / 자격 증명"
-        }
-        printerAuthButton.setOnClickListener { showPrinterAuthDialog(printer) }
+        updatePrinterAuthButton(printer)
         formatsLabel.text = if (printer.formats.isEmpty()) {
             "지원 출력 형식: 프린터가 형식 정보를 제공하지 않음"
         } else {
@@ -2137,6 +2178,16 @@ class MainActivity : Activity() {
         setExtendedPrintOptions(printer)
         setContentMarginOptions(printer)
         setSubmissionMethodOptions(printer)
+    }
+
+    private fun updatePrinterAuthButton(printer: PrinterRecord) {
+        printerAuthButton.visibility = View.VISIBLE
+        printerAuthButton.text = if (IppClient.hasCredentials(printer.endpoint)) {
+            "프린터 로그인 변경 / 삭제"
+        } else {
+            "프린터 로그인 / 자격 증명"
+        }
+        printerAuthButton.setOnClickListener { showPrinterAuthDialog(printer) }
     }
 
     private fun setContentMarginOptions(printer: PrinterRecord?) {
@@ -2246,7 +2297,7 @@ class MainActivity : Activity() {
         orientationValues = configureOptions(orientationSpinner, printer?.orientations.orEmpty(), printer?.defaultOrientation, ::orientationLabel)
         printQualityValues = configureOptions(printQualitySpinner, printer?.printQualities.orEmpty(), printer?.defaultPrintQuality, ::qualityLabel)
         resolutionValues = configureOptions(resolutionSpinner, printer?.resolutions.orEmpty(), printer?.defaultResolution) { it.label }
-        numberUpValues = configureOptions(numberUpSpinner, printer?.numberUps.orEmpty(), printer?.defaultNumberUp) { "${it}페이지" }
+        configurePageControls(printer)
         xPositionValues = configureOptions(xPositionSpinner, printer?.xImagePositions.orEmpty(), printer?.defaultXImagePosition, ::xPositionLabel)
         yPositionValues = configureOptions(yPositionSpinner, printer?.yImagePositions.orEmpty(), printer?.defaultYImagePosition, ::yPositionLabel)
         val copies = printer?.copiesSupported
@@ -2254,8 +2305,6 @@ class MainActivity : Activity() {
         copiesInput.hint = copies?.let { "${it.lower}~${it.upper}부" } ?: "1"
         copiesInput.isEnabled = copies != null && copies.upper > 1
         pageRangesInput.setText("")
-        pageRangesInput.isEnabled = printer?.pageRangesSupported == true
-        pageRangesInput.hint = if (printer?.pageRangesSupported == true) "예: 1-3,5" else "프린터 미지원"
     }
 
     private fun <T> configureOptions(
@@ -2347,6 +2396,8 @@ class MainActivity : Activity() {
                 runCatching { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
                 fileLabel.text = fileDisplayName(uri)
             }
+            selectedFileMime = null
+            inspectSelectedDocument()
             updateDocumentInputAvailability()
         }
     }
@@ -2385,13 +2436,63 @@ class MainActivity : Activity() {
             }
         }
         setDocumentInputEnabled(clearFileButton, selectedFile != null)
+        if (!restoringEditor) configurePageControls(selected)
+    }
+
+    private fun inspectSelectedDocument() {
+        val uri = selectedFile ?: return
+        val generation = ++documentInspectionGeneration
+        io.execute {
+            val mime = runCatching { filePreparer.inspectMime(uri) }
+            main.post {
+                if (generation != documentInspectionGeneration || uri != selectedFile || isFinishing || isDestroyed) return@post
+                selectedFileMime = mime.getOrNull()
+                configurePageControls(selected)
+                mime.exceptionOrNull()?.let {
+                    updateStatus("문서를 확인할 수 없습니다: ${it.message}", StatusTone.ERROR)
+                }
+            }
+        }
+    }
+
+    private fun configurePageControls(printer: PrinterRecord?) {
+        if (!::numberUpSpinner.isInitialized || !::pageRangesInput.isInitialized) return
+        val remote = ::remoteDocumentUri.isInitialized && remoteDocumentUri.text.isNotBlank() && selectedFile == null
+        val controls = PrintCapabilityPolicy.layoutControls(printer, selectedFileMime, remote)
+        val previous = numberUpValues.getOrNull(numberUpSpinner.selectedItemPosition)
+        numberUpValues = listOf<Int?>(null) + controls.numberUpChoices
+        val defaultLabel = printer?.defaultNumberUp?.let { "프린터 기본값 (${it}페이지)" } ?: "프린터 기본값"
+        numberUpSpinner.adapter = scrollableSpinnerAdapter(listOf(defaultLabel) + controls.numberUpChoices.map { "${it}페이지" })
+        numberUpSpinner.isEnabled = controls.numberUpChoices.isNotEmpty()
+        numberUpSpinner.setSelection(numberUpValues.indexOf(previous).coerceAtLeast(0))
+        submissionMethodSpinner.isEnabled = !remote && submissionMethodValues.size > 1
+        pageRangesInput.isEnabled = controls.pageRangesAllowed
+        pageRangesInput.hint = controls.pageRangesHint
+        if (::pageHandlingLabel.isInitialized) pageHandlingLabel.text = when {
+            controls.appCanLayout -> "페이지 범위와 모아찍기는 앱에서 문서에 적용합니다."
+            remote -> "문서 URL은 프린터가 직접 처리합니다. 프린터가 지원하는 옵션만 선택할 수 있습니다."
+            selectedFile != null -> "이 형식은 앱에서 페이지를 재배치하지 않습니다. 지원되는 옵션은 프린터에서 처리합니다."
+            else -> "PDF·사진·텍스트를 선택하면 앱의 페이지 선택과 모아찍기를 사용할 수 있습니다."
+        }
+        if (::contentHorizontalSpinner.isInitialized) {
+            listOf<View>(contentHorizontalSpinner, contentVerticalSpinner, contentScaleSpinner,
+                contentMarginSpinner, contentScalePercentInput, contentOffsetXInput, contentOffsetYInput,
+                applyLayoutToPdf, rasterDpiSpinner, psEncodingSpinner).forEach {
+                setDocumentInputEnabled(it, controls.appCanLayout)
+            }
+        }
     }
 
     private fun validateAndPrint() {
+        if (printGate.isBusy()) {
+            Toast.makeText(this, "인쇄 요청을 처리 중입니다", Toast.LENGTH_SHORT).show()
+            return
+        }
         if (!ensurePrintAuthorized()) return
         val printer = selected ?: run { Toast.makeText(this, "프린터를 선택하세요", Toast.LENGTH_SHORT).show(); return }
-        if (!printer.supportsPrintJob && !printer.supportsCreateSendDocument) {
-            Toast.makeText(this, "이 프린터는 Print-Job 또는 Create-Job/Send-Document 지원을 광고하지 않습니다", Toast.LENGTH_LONG).show()
+        val isRemote = selectedFile == null && remoteDocumentUri.text.isNotBlank()
+        if (!PrintCapabilityPolicy.supportsSubmission(printer, isRemote)) {
+            Toast.makeText(this, if (isRemote) "이 프린터는 문서 URL 인쇄(Print-URI 또는 Send-URI)를 지원하지 않습니다" else "이 프린터는 파일 인쇄(Print-Job 또는 Send-Document)를 지원하지 않습니다", Toast.LENGTH_LONG).show()
             return
         }
         if (selectedFile == null && remoteDocumentUri.text.isBlank()) {
@@ -2421,19 +2522,80 @@ class MainActivity : Activity() {
                 return
             }
         }
-        val optionError = runCatching {
-            selectedCopies(printer)
-            selectedPageRanges()
-            selectedContentLayout()
-        }.exceptionOrNull()
-        if (optionError != null) {
-            Toast.makeText(this, optionError.message ?: "출력 옵션을 확인하세요", Toast.LENGTH_LONG).show()
+        val request = runCatching { capturePrintRequest(printer) }.getOrElse {
+            Toast.makeText(this, it.message ?: "출력 옵션을 확인하세요", Toast.LENGTH_LONG).show()
             return
         }
-        printAfterSavingPrinter(printer)
+        PrintWorkManager.reserve(request) ?: return
+        printButton.isEnabled = false
+        printButton.text = "인쇄 준비 중"
     }
 
+    private fun capturePrintRequest(printer: PrinterRecord): PrintWorkRequest = PrintWorkRequest(
+        printer = printer,
+        file = selectedFile,
+        remoteUri = remoteDocumentUri.text.toString().trim().takeIf { selectedFile == null && it.isNotBlank() },
+        settings = if (selectedFile == null && remoteDocumentUri.text.isNotBlank()) {
+            FilePreparationSettings(ContentLayoutOptions(), false, false, false, emptyList(), 1)
+        } else filePreparationSettings(),
+        options = IppJobOptions(
+            copies = selectedCopies(printer),
+            pageRanges = selectedPageRanges(),
+            colorMode = colorModeValues.getOrNull(colorModeSpinner.selectedItemPosition),
+            media = mediaValues.getOrNull(mediaSpinner.selectedItemPosition),
+            printScaling = printScalingValues.getOrNull(printScalingSpinner.selectedItemPosition),
+            sides = sidesValues.getOrNull(sidesSpinner.selectedItemPosition),
+            orientation = orientationValues.getOrNull(orientationSpinner.selectedItemPosition),
+            printQuality = printQualityValues.getOrNull(printQualitySpinner.selectedItemPosition),
+            resolution = resolutionValues.getOrNull(resolutionSpinner.selectedItemPosition),
+            numberUp = numberUpValues.getOrNull(numberUpSpinner.selectedItemPosition),
+            xImagePosition = xPositionValues.getOrNull(xPositionSpinner.selectedItemPosition),
+            yImagePosition = yPositionValues.getOrNull(yPositionSpinner.selectedItemPosition),
+        ),
+        submissionMethod = submissionMethodValues.getOrElse(submissionMethodSpinner.selectedItemPosition) { JobSubmissionMethod.AUTO },
+    )
+
+    private fun setPrintPhase(requestId: Long, label: String) {
+        if (!printGate.isActive(requestId) || isFinishing || isDestroyed) return
+        printButton.isEnabled = false
+        printButton.text = label
+        printButton.alpha = 0.65f
+    }
+
+    private fun finishPrintRequest(requestId: Long) {
+        PrintWorkManager.cancel(requestId)
+    }
+
+    private fun filePreparationSettings(): FilePreparationSettings {
+        if (selectedFileMime != null && !PrintCapabilityPolicy.appCanLayout(selectedFileMime)) {
+            return FilePreparationSettings(ContentLayoutOptions(), false, false,
+                forcePostScript.isChecked, selectedPageRanges(),
+                numberUpValues.getOrNull(numberUpSpinner.selectedItemPosition) ?: 1)
+        }
+        val layout = selectedContentLayout()
+        val defaultMargin = advertisedPrinterMargins(selected)?.maxOrNull()
+            ?.let { (it * 72f / 25.4f).toInt().coerceAtLeast(0) } ?: 43
+        val changed = layout.horizontal != ContentHorizontal.CENTER || layout.vertical != ContentVertical.CENTER ||
+            layout.scale != ContentScale.FIT || layout.margin != defaultMargin ||
+            layout.scalePercent != 100f || layout.offsetX != 0f || layout.offsetY != 0f ||
+            layout.rotationDegrees != 0f || mediaSpinner.selectedItemPosition > 0 ||
+            orientationSpinner.selectedItemPosition > 0 || printScalingSpinner.selectedItemPosition > 0 ||
+            xPositionSpinner.selectedItemPosition > 0 || yPositionSpinner.selectedItemPosition > 0
+        return FilePreparationSettings(
+            layout, changed, applyLayoutToPdf.isChecked, forcePostScript.isChecked,
+            selectedPageRanges(),
+            numberUpValues.getOrNull(numberUpSpinner.selectedItemPosition) ?: selected?.defaultNumberUp ?: 1,
+        )
+    }
+
+    private data class ReadyPreview(
+        val session: PdfPreviewSession,
+        val firstPage: RenderedPreview,
+        val layoutApplied: Boolean,
+    )
+
     private fun showPrintPreview() {
+        val printer = selected ?: run { Toast.makeText(this, "프린터를 선택하세요", Toast.LENGTH_SHORT).show(); return }
         val file = selectedFile
         val remote = remoteDocumentUri.text.toString().trim()
         if (file == null) {
@@ -2442,74 +2604,41 @@ class MainActivity : Activity() {
             Toast.makeText(this, message, Toast.LENGTH_LONG).show()
             return
         }
-        val layout = runCatching { selectedContentLayout() }.getOrElse {
-            Toast.makeText(this, it.message ?: "레이아웃 값을 확인하세요", Toast.LENGTH_LONG).show()
+        val settings = runCatching { filePreparationSettings() }.getOrElse {
+            Toast.makeText(this, it.message ?: "출력 설정을 확인하세요", Toast.LENGTH_LONG).show()
             return
         }
         val paperLabel = selectedPaperLabel()
-        val layoutPdf = applyLayoutToPdf.isChecked
-        val pageRanges = runCatching { selectedPageRanges() }.getOrElse {
-            Toast.makeText(this, it.message ?: "페이지 범위를 확인하세요", Toast.LENGTH_LONG).show()
-            return
-        }
-        val numberUp = numberUpValues.getOrNull(numberUpSpinner.selectedItemPosition) ?: 1
+        val generation = ++previewGeneration
+        activePreviewDialog?.dismiss()
         updateStatus("미리보기 생성 중", StatusTone.ACTIVE)
         io.execute {
             val result = runCatching {
-                val name = fileDisplayName(file)
-                val bytes = readFileLimited(file, MAX_FILE_BYTES)
-                val previewPdf = when (detectMime(file, name, bytes)) {
-                    "application/pdf" -> if (layoutPdf || layout.rotationDegrees != 0f) {
-                        contentResolver.openFileDescriptor(file, "r")?.use { descriptor ->
-                            DocumentRenderer.pdfWithLayout(descriptor, layout)
-                        } ?: error("PDF 파일을 열 수 없습니다")
-                    } else bytes
-                    "text/plain" -> DocumentRenderer.textPdf(name, bytes.toString(Charsets.UTF_8), layout)
-                    "image/jpeg", "image/png", "image/tiff" -> DocumentRenderer.imagePdf(bytes, layout)
-                    else -> error("이 파일 형식은 앱에서 미리 볼 수 없습니다")
+                val document = filePreparer.build(printer, file, settings, forPreview = true)
+                val session = PdfPreviewSession.create(document.laidOutPdf ?: error("미리보기 문서를 만들 수 없습니다"), cacheDir)
+                try {
+                    ReadyPreview(session, session.renderPage(0), document.plan.renderPages)
+                } catch (error: Throwable) {
+                    session.close()
+                    throw error
                 }
-                val finalPreviewPdf = applySheetOptions(previewPdf, pageRanges, numberUp, layout)
-                renderPreviewBytes(finalPreviewPdf, 0, null)
             }
             main.post {
-                result.onSuccess { preview ->
-                    updateStatus("미리보기 준비됨", StatusTone.SUCCESS)
-                    showPreviewDialog(preview, paperLabel, layout)
+                if (generation != previewGeneration || isFinishing || isDestroyed) {
+                    result.getOrNull()?.let { ready ->
+                        ready.firstPage.bitmap.recycle()
+                        ready.session.close()
+                    }
+                    return@post
+                }
+                result.onSuccess { ready ->
+                    updateStatus(if (ready.layoutApplied) "전송할 문서의 배치 미리보기" else "원본 미리보기 · 배치는 프린터에서 처리합니다", StatusTone.SUCCESS)
+                    showPreviewDialog(ready.session, ready.firstPage, paperLabel, settings.layout, ready.layoutApplied)
                 }.onFailure {
                     updateStatus("미리보기 실패: ${it.message ?: it.javaClass.simpleName}", StatusTone.ERROR)
                     Toast.makeText(this, status.text, Toast.LENGTH_LONG).show()
                 }
             }
-        }
-    }
-
-    private fun renderPreviewBytes(bytes: ByteArray, pageIndex: Int, orientation: Int?): RenderedPreview {
-        val temp = java.io.File.createTempFile("ipp-preview-", ".pdf", cacheDir)
-        return try {
-            temp.outputStream().use { it.write(bytes) }
-            android.os.ParcelFileDescriptor.open(temp, android.os.ParcelFileDescriptor.MODE_READ_ONLY).use { descriptor ->
-                DocumentRenderer.pdfPagePreview(descriptor, pageIndex, orientation)
-            }
-        } finally {
-            temp.delete()
-        }
-    }
-
-    private fun applySheetOptions(
-        bytes: ByteArray,
-        pageRanges: List<IppRange>,
-        numberUp: Int,
-        layout: ContentLayoutOptions,
-    ): ByteArray {
-        if (pageRanges.isEmpty() && numberUp <= 1) return bytes
-        val temp = java.io.File.createTempFile("ipp-sheet-source-", ".pdf", cacheDir)
-        return try {
-            temp.outputStream().use { it.write(bytes) }
-            android.os.ParcelFileDescriptor.open(temp, android.os.ParcelFileDescriptor.MODE_READ_ONLY).use { descriptor ->
-                DocumentRenderer.imposePdf(descriptor, pageRanges, numberUp, layout.pageWidth, layout.pageHeight, layout.rasterDpi)
-            }
-        } finally {
-            temp.delete()
         }
     }
 
@@ -2571,231 +2700,172 @@ class MainActivity : Activity() {
     }
 
     private fun showPreviewDialog(
-        preview: RenderedPreview,
+        session: PdfPreviewSession,
+        firstPage: RenderedPreview,
         paperLabel: String,
         layout: ContentLayoutOptions,
+        layoutApplied: Boolean,
     ) {
+        var currentPage = firstPage
+        var loading = false
+        var closed = false
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(12), dp(12), dp(4))
         }
         val marginInfo = previewMarginInfo(layout)
-        container.addView(
-            PaperPreviewView(this, preview.bitmap, marginInfo.insets),
-            LinearLayout.LayoutParams(-1, 0, 1f),
-        )
+        val paperView = PaperPreviewView(this, firstPage.bitmap, marginInfo.insets)
+        container.addView(paperView, LinearLayout.LayoutParams(-1, 0, 1f))
+        val navigation = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val pageIndicator = TextView(this).apply {
+            gravity = Gravity.CENTER
+            textSize = 14f
+            setTextColor(ink)
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+        }
+        val pageStatus = TextView(this).apply {
+            textSize = 12f
+            setTextColor(danger)
+            visibility = View.GONE
+            setPadding(0, dp(6), 0, 0)
+        }
+        lateinit var previousButton: Button
+        lateinit var nextButton: Button
+        fun updateNavigation() {
+            previousButton.isEnabled = !closed && !loading && currentPage.pageIndex > 0
+            nextButton.isEnabled = !closed && !loading && currentPage.pageIndex + 1 < currentPage.pageCount
+            previousButton.alpha = if (previousButton.isEnabled) 1f else 0.4f
+            nextButton.alpha = if (nextButton.isEnabled) 1f else 0.4f
+            pageIndicator.text = "${currentPage.pageIndex + 1} / ${currentPage.pageCount}페이지" +
+                if (loading) "\n불러오는 중…" else ""
+        }
+        fun releasePreview() {
+            if (closed) return
+            closed = true
+            paperView.setPageBitmap(null)
+            currentPage.bitmap.recycle()
+            session.close()
+        }
+        fun loadPage(index: Int) {
+            if (closed || loading || index !in 0 until currentPage.pageCount) return
+            loading = true
+            pageStatus.visibility = View.GONE
+            updateNavigation()
+            io.execute {
+                val result = runCatching { session.renderPage(index) }
+                main.post {
+                    if (closed || isFinishing || isDestroyed) {
+                        result.getOrNull()?.bitmap?.recycle()
+                        releasePreview()
+                        return@post
+                    }
+                    loading = false
+                    result.onSuccess { next ->
+                        val oldBitmap = currentPage.bitmap
+                        paperView.setPageBitmap(next.bitmap)
+                        currentPage = next
+                        oldBitmap.recycle()
+                    }.onFailure {
+                        pageStatus.text = "페이지를 불러오지 못했습니다: ${it.message ?: it.javaClass.simpleName}"
+                        pageStatus.visibility = View.VISIBLE
+                    }
+                    updateNavigation()
+                }
+            }
+        }
+        previousButton = button("이전") { loadPage(currentPage.pageIndex - 1) }
+        nextButton = button("다음") { loadPage(currentPage.pageIndex + 1) }
+        navigation.addView(previousButton)
+        navigation.addView(pageIndicator, LinearLayout.LayoutParams(0, -2, 1f))
+        navigation.addView(nextButton)
+        container.addView(navigation, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+        container.addView(pageStatus)
         container.addView(TextView(this).apply {
             text = "흰색 테두리는 실제 $paperLabel 용지 경계입니다. 붉은 영역은 출력되지 않을 수 있습니다.\n" +
                 "${marginInfo.description}\n" +
-                "${preview.pageIndex + 1}/${preview.pageCount}페이지 · 양면, 한 장당 페이지 수, 급지함 등은 프린터에서 적용됩니다"
+                (if (layoutApplied) "표시한 용지·배치·페이지 선택을 문서에 적용해 전송합니다. 양면·급지함은 프린터에서 적용합니다."
+                else "원본 전송 미리보기입니다. 실제 글꼴·크기·배치는 프린터에서 처리합니다.")
             textSize = 12f
             setTextColor(Color.rgb(80, 90, 105))
             setPadding(0, dp(8), 0, 0)
         })
+        updateNavigation()
         val dialog = android.app.AlertDialog.Builder(this)
             .setTitle("출력 페이지 미리보기")
             .setView(container)
             .setPositiveButton("닫기", null)
             .create()
-        dialog.setOnDismissListener { preview.bitmap.recycle() }
+        dialog.setOnDismissListener {
+            releasePreview()
+            if (activePreviewDialog === dialog) activePreviewDialog = null
+        }
         dialog.setOnShowListener {
             dialog.window?.setLayout((resources.displayMetrics.widthPixels * 0.94f).toInt(), (resources.displayMetrics.heightPixels * 0.88f).toInt())
         }
-        dialog.show()
-    }
-
-    private fun sendOneJob(printer: PrinterRecord) {
-        hideCidrProgress()
-        updateStatus("${printer.endpoint.host}에 1회 전송 중", StatusTone.ACTIVE)
-        val colorMode = colorModeValues.getOrNull(colorModeSpinner.selectedItemPosition)
-        val media = mediaValues.getOrNull(mediaSpinner.selectedItemPosition)
-        val requestedPrintScaling = printScalingValues.getOrNull(printScalingSpinner.selectedItemPosition)
-        val requestedOrientation = orientationValues.getOrNull(orientationSpinner.selectedItemPosition)
-        val requestedXPosition = xPositionValues.getOrNull(xPositionSpinner.selectedItemPosition)
-        val requestedYPosition = yPositionValues.getOrNull(yPositionSpinner.selectedItemPosition)
-        val remoteUri = remoteDocumentUri.text.toString().trim().takeIf { selectedFile == null && it.isNotBlank() }
-        val layoutBakedIntoDocument = remoteUri == null
-        val requestedPageRanges = selectedPageRanges()
-        val requestedNumberUp = numberUpValues.getOrNull(numberUpSpinner.selectedItemPosition)
-        val options = IppJobOptions(
-            copies = selectedCopies(printer),
-            pageRanges = if (layoutBakedIntoDocument) emptyList() else requestedPageRanges,
-            colorMode = colorMode,
-            media = media,
-            printScaling = if (layoutBakedIntoDocument) printer.printScalings.firstOrNull { it.equals("none", true) }
-                else requestedPrintScaling,
-            sides = sidesValues.getOrNull(sidesSpinner.selectedItemPosition),
-            orientation = if (layoutBakedIntoDocument) null else requestedOrientation,
-            printQuality = printQualityValues.getOrNull(printQualitySpinner.selectedItemPosition),
-            resolution = resolutionValues.getOrNull(resolutionSpinner.selectedItemPosition),
-            numberUp = if (layoutBakedIntoDocument) null else requestedNumberUp,
-            xImagePosition = if (layoutBakedIntoDocument) null else requestedXPosition,
-            yImagePosition = if (layoutBakedIntoDocument) null else requestedYPosition,
-        )
-        val submissionMethod = submissionMethodValues.getOrElse(submissionMethodSpinner.selectedItemPosition) { JobSubmissionMethod.AUTO }
-        val contentLayout = selectedContentLayout()
-        val layoutPdf = applyLayoutToPdf.isChecked
-        io.execute {
-            val result = runCatching {
-                if (remoteUri != null) {
-                    val remoteName = java.net.URI(remoteUri).path.substringAfterLast('/').ifBlank { "원격 문서" }
-                    IppClient.printRemoteUri(printer, remoteUri, remoteName, options)
-                } else {
-                    val file = selectedFile ?: error("출력할 파일을 선택하세요")
-                    val prepared = prepareFile(printer, file, contentLayout, layoutPdf)
-                    val finalPrepared = if (prepared.layoutBakedIn && prepared.mime == "application/pdf") {
-                        prepared.copy(bytes = applySheetOptions(prepared.bytes, requestedPageRanges, requestedNumberUp ?: 1, contentLayout))
-                    } else prepared
-                    val finalOptions = when {
-                        !finalPrepared.layoutBakedIn -> options.copy(
-                            pageRanges = requestedPageRanges,
-                            printScaling = requestedPrintScaling,
-                            orientation = requestedOrientation,
-                            numberUp = requestedNumberUp,
-                            xImagePosition = requestedXPosition,
-                            yImagePosition = requestedYPosition,
-                        )
-                        finalPrepared.mime == "application/pdf" -> options
-                        else -> options.copy(
-                            pageRanges = requestedPageRanges,
-                            // The app has already applied the selected page layout.
-                            // Prevent the printer from fitting/scaling it a second time.
-                            printScaling = options.printScaling,
-                            orientation = null,
-                            numberUp = requestedNumberUp,
-                            xImagePosition = null,
-                            yImagePosition = null,
-                        )
-                    }
-                    require(finalPrepared.bytes.size <= MAX_FILE_BYTES) {
-                        "전송 실패: 생성된 문서가 50 MiB 한도를 초과했습니다. 해상도나 압축 설정을 직접 변경하거나 문서를 나누어 주세요. 자동 축소하지 않았습니다."
-                    }
-                    IppClient.print(printer, finalPrepared.bytes, finalPrepared.mime, finalPrepared.displayName, finalOptions, submissionMethod)
-                }
-            }.getOrElse {
-                PrintResult(false, null, null, null,
-                    if (it is OutOfMemoryError) "전송 실패: 선택한 품질의 문서를 처리할 메모리가 부족합니다. 해상도·압축 설정을 직접 변경해 주세요. 자동으로 품질을 낮추지 않았습니다."
-                    else it.message ?: "문서를 준비하는 중 알 수 없는 오류가 발생했습니다")
-            }
-            main.post {
-                if (result.accepted) {
-                    updateStatus("${result.method ?: "IPP"} 수락됨 (job-id ${result.jobId ?: "-"}) — 실제 용지 출력은 직접 확인하세요", StatusTone.SUCCESS)
-                } else if (result.authRequired) {
-                    updateStatus(
-                        "출력 전에 프린터 로그인이 필요합니다: ${result.authChallenge?.label ?: "방식 미확인"}",
-                        StatusTone.ERROR,
-                    )
-                    showPrinterAuthDialog(printer, result.authChallenge) {
-                        sendOneJob(printer)
-                    }
-                } else {
-                    val error = result.error ?: "IPP 0x${result.ippStatus?.toString(16)}"
-                    updateStatus(if (error.startsWith("전송 실패:")) error else "출력 요청 실패: $error", StatusTone.ERROR)
-                }
-            }
+        activePreviewDialog = dialog
+        try {
+            dialog.show()
+        } catch (error: RuntimeException) {
+            releasePreview()
+            if (activePreviewDialog === dialog) activePreviewDialog = null
+            updateStatus("미리보기 창을 열 수 없습니다: ${error.message}", StatusTone.ERROR)
         }
     }
 
-    private fun prepareFile(
-        printer: PrinterRecord,
-        uri: Uri,
-        contentLayout: ContentLayoutOptions,
-        layoutPdf: Boolean,
-    ): PreparedDocument {
-        val name = fileDisplayName(uri)
-        val bytes = readFileLimited(uri, MAX_FILE_BYTES)
-        val sourceMime = detectMime(uri, name, bytes)
-        val canonicalSource = PrintFormatSupport.normalize(sourceMime)
-        val formats = printer.formats
-        val pdfMime = PrintFormatSupport.advertisedMime(formats, PrintFormatSupport.PDF)
-        val postScriptMime = PrintFormatSupport.advertisedMime(formats, PrintFormatSupport.POSTSCRIPT)
-        val pwgMime = PrintFormatSupport.advertisedMime(formats, PrintFormatSupport.PWG_RASTER)
-        val urfMime = PrintFormatSupport.advertisedMime(formats, PrintFormatSupport.URF)
-        val pclMime = PrintFormatSupport.advertisedMime(formats, PrintFormatSupport.PCL)
-        val directMime = PrintFormatSupport.directSubmissionMime(
-            formats,
-            canonicalSource,
-            forcePostScript.isChecked || (canonicalSource == "text/plain" && applyTextStyle.isChecked),
-        )
-        val prepared = when {
-            forcePostScript.isChecked && postScriptMime == null ->
-                error("선택한 프린터가 PostScript 출력을 광고하지 않습니다")
-            forcePostScript.isChecked && canonicalSource == PrintFormatSupport.POSTSCRIPT ->
-                PreparedDocument(bytes, postScriptMime!!, name, layoutBakedIn = false)
-            forcePostScript.isChecked && canonicalSource == PrintFormatSupport.PDF -> {
-                val rendered = contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->
-                    DocumentRenderer.pdfPostScript(descriptor, contentLayout)
-                } ?: error("PDF 파일을 열 수 없습니다")
-                PreparedDocument(rendered, postScriptMime!!, "$name.ps")
-            }
-            forcePostScript.isChecked && canonicalSource.startsWith("image/") ->
-                PreparedDocument(DocumentRenderer.imagePostScript(bytes, contentLayout), postScriptMime!!, "$name.ps")
-            forcePostScript.isChecked && canonicalSource == "text/plain" ->
-                PreparedDocument(
-                    DocumentRenderer.textPostScript(name, bytes.toString(Charsets.UTF_8), contentLayout),
-                    postScriptMime!!,
-                    "$name.ps",
-                )
-            forcePostScript.isChecked ->
-                error("이 파일은 앱에서 PostScript로 변환할 수 없습니다. PDF, 사진 또는 일반 텍스트 파일을 선택하세요")
-            canonicalSource == PrintFormatSupport.PDF && pdfMime != null &&
-                (layoutPdf || contentLayout.rotationDegrees != 0f) -> {
-                val rendered = contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->
-                    DocumentRenderer.pdfWithLayout(descriptor, contentLayout)
-                } ?: error("PDF 파일을 열 수 없습니다")
-                PreparedDocument(rendered, pdfMime, "배치-$name")
-            }
-            directMime != null -> PreparedDocument(bytes, directMime, name, layoutBakedIn = false)
-            canonicalSource.startsWith("image/") && pdfMime != null ->
-                PreparedDocument(DocumentRenderer.imagePdf(bytes, contentLayout), pdfMime, "$name.pdf")
-            canonicalSource == "text/plain" && pdfMime != null ->
-                PreparedDocument(DocumentRenderer.textPdf(name, bytes.toString(Charsets.UTF_8), contentLayout), pdfMime, "$name.pdf")
-            canonicalSource == PrintFormatSupport.PDF && postScriptMime != null -> {
-                val rendered = contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->
-                    DocumentRenderer.pdfPostScript(descriptor, contentLayout)
-                } ?: error("PDF 파일을 열 수 없습니다")
-                PreparedDocument(rendered, postScriptMime, "$name.ps")
-            }
-            canonicalSource.startsWith("image/") && postScriptMime != null ->
-                PreparedDocument(DocumentRenderer.imagePostScript(bytes, contentLayout), postScriptMime, "$name.ps")
-            canonicalSource == "text/plain" && postScriptMime != null ->
-                PreparedDocument(DocumentRenderer.textPostScript(name, bytes.toString(Charsets.UTF_8), contentLayout), postScriptMime, "$name.ps")
-            canonicalSource == PrintFormatSupport.PDF && pwgMime != null -> {
-                val rendered = contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->
-                    DocumentRenderer.pdfPwgRaster(descriptor, contentLayout)
-                } ?: error("PDF 파일을 열 수 없습니다")
-                PreparedDocument(rendered, pwgMime, "$name.pwg")
-            }
-            canonicalSource.startsWith("image/") && pwgMime != null ->
-                PreparedDocument(DocumentRenderer.imagePwgRaster(bytes, contentLayout), pwgMime, "$name.pwg")
-            canonicalSource == "text/plain" && pwgMime != null ->
-                PreparedDocument(DocumentRenderer.textPwgRaster(name, bytes.toString(Charsets.UTF_8), contentLayout), pwgMime, "$name.pwg")
-            canonicalSource == PrintFormatSupport.PDF && urfMime != null -> {
-                val rendered = contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->
-                    DocumentRenderer.pdfUrf(descriptor, contentLayout)
-                } ?: error("PDF 파일을 열 수 없습니다")
-                PreparedDocument(rendered, urfMime, "$name.urf")
-            }
-            canonicalSource.startsWith("image/") && urfMime != null ->
-                PreparedDocument(DocumentRenderer.imageUrf(bytes, contentLayout), urfMime, "$name.urf")
-            canonicalSource == "text/plain" && urfMime != null ->
-                PreparedDocument(DocumentRenderer.textUrf(name, bytes.toString(Charsets.UTF_8), contentLayout), urfMime, "$name.urf")
-            canonicalSource == PrintFormatSupport.PDF && pclMime != null -> {
-                val rendered = contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->
-                    DocumentRenderer.pdfPcl(descriptor, contentLayout)
-                } ?: error("PDF 파일을 열 수 없습니다")
-                PreparedDocument(rendered, pclMime, "$name.pcl")
-            }
-            canonicalSource.startsWith("image/") && pclMime != null ->
-                PreparedDocument(DocumentRenderer.imagePcl(bytes, contentLayout), pclMime, "$name.pcl")
-            canonicalSource == "text/plain" && pclMime != null ->
-                PreparedDocument(DocumentRenderer.textPcl(name, bytes.toString(Charsets.UTF_8), contentLayout), pclMime, "$name.pcl")
-            else -> error(PrintFormatSupport.unsupportedFileMessage(name, sourceMime, formats))
+    private fun sendOneJob(requestId: Long) {
+        PrintWorkManager.submit(applicationContext, requestId)
+    }
+
+    private fun renderPrintWork(work: PrintWorkState) {
+        if (isFinishing || isDestroyed) return
+        val busy = printGate.isBusy()
+        printButton.isEnabled = !busy
+        printButton.alpha = if (busy) 0.65f else 1f
+        printButton.text = when (work.phase) {
+            PrintWorkPhase.WAITING_NAME -> "이름 설정 중"
+            PrintWorkPhase.PREPARING -> "문서 준비 중"
+            PrintWorkPhase.SENDING -> "전송 중"
+            PrintWorkPhase.AUTH_REQUIRED -> "로그인 대기"
+            else -> "인쇄하기"
         }
-        require(prepared.bytes.size <= MAX_FILE_BYTES) {
-            "변환된 출력 데이터가 50MB를 초과합니다 (${prepared.bytes.size / 1024 / 1024}MB)"
+        when (work.phase) {
+            PrintWorkPhase.WAITING_NAME -> if (activePrintDialog?.isShowing != true) {
+                try {
+                    printAfterSavingPrinter(work.request, work.requestId)
+                } catch (error: RuntimeException) {
+                    PrintWorkManager.failPending(work.requestId, "프린터 이름 창을 열 수 없습니다: ${error.message}")
+                }
+            }
+            PrintWorkPhase.PREPARING -> updateStatus("출력 문서 준비 중", StatusTone.ACTIVE)
+            PrintWorkPhase.SENDING -> updateStatus("${work.request.printer.endpoint.host}에 출력 요청 전송 중", StatusTone.ACTIVE)
+            PrintWorkPhase.AUTH_REQUIRED -> {
+                updateStatus("출력 전에 프린터 로그인이 필요합니다", StatusTone.ERROR)
+                if (activePrintDialog?.isShowing != true) {
+                    try {
+                        showPrinterAuthDialog(
+                            work.request.printer,
+                            challengeOverride = work.result?.authChallenge,
+                            onCancelled = { finishPrintRequest(work.requestId) },
+                            onCredentialsReady = { sendOneJob(work.requestId) },
+                        )
+                    } catch (error: RuntimeException) {
+                        PrintWorkManager.failPending(work.requestId, "프린터 로그인 창을 열 수 없습니다: ${error.message}")
+                    }
+                }
+            }
+            PrintWorkPhase.ACCEPTED -> {
+                val result = work.result
+                updateStatus("${result?.method ?: "IPP"} 수락됨 (job-id ${result?.jobId ?: "-"}) — 실제 용지 출력은 직접 확인하세요", StatusTone.SUCCESS)
+            }
+            PrintWorkPhase.FAILED -> {
+                val error = work.result?.error ?: "인쇄 요청을 처리할 수 없습니다"
+                updateStatus(if (error.startsWith("전송 실패:")) error else "출력 요청 실패: $error", StatusTone.ERROR)
+            }
+            PrintWorkPhase.CANCELLED -> updateStatus("인쇄 요청을 취소했습니다", StatusTone.NEUTRAL)
         }
-        return prepared
     }
 
     private fun selectedContentLayout(): ContentLayoutOptions {
@@ -2805,9 +2875,16 @@ class MainActivity : Activity() {
         val (pageWidth, pageHeight) = mediaPageSize(media)
         val ippX = xPositionValues.getOrNull(xPositionSpinner.selectedItemPosition)?.lowercase()
         val ippY = yPositionValues.getOrNull(yPositionSpinner.selectedItemPosition)?.lowercase()
-        val scalePercent = contentScalePercentInput.text.toString().trim().toFloatOrNull() ?: 100f
-        val offsetXmm = contentOffsetXInput.text.toString().trim().toFloatOrNull() ?: 0f
-        val offsetYmm = contentOffsetYInput.text.toString().trim().toFloatOrNull() ?: 0f
+        val ippScaling = printScalingValues.getOrNull(printScalingSpinner.selectedItemPosition)?.lowercase()
+        val scalePercent = contentScalePercentInput.text.toString().trim().let {
+            if (it.isBlank()) 100f else it.toFloatOrNull() ?: error("내용 크기를 숫자로 입력하세요")
+        }
+        val offsetXmm = contentOffsetXInput.text.toString().trim().let {
+            if (it.isBlank()) 0f else it.toFloatOrNull() ?: error("가로 이동값을 숫자로 입력하세요")
+        }
+        val offsetYmm = contentOffsetYInput.text.toString().trim().let {
+            if (it.isBlank()) 0f else it.toFloatOrNull() ?: error("세로 이동값을 숫자로 입력하세요")
+        }
         val printableMarginsMm = advertisedPrinterMargins(selected) ?: listOf(5f, 5f, 5f, 5f)
         val printableMarginsPt = printableMarginsMm.map { (it * 72f / 25.4f).toInt().coerceAtLeast(0) }
         require(scalePercent in 10f..400f) { "내용 크기는 10~400%로 입력하세요" }
@@ -2825,19 +2902,20 @@ class MainActivity : Activity() {
                 "center" -> ContentVertical.CENTER
                 else -> ContentVertical.entries.getOrElse(contentVerticalSpinner.selectedItemPosition) { ContentVertical.CENTER }
             },
-            scale = when (contentScaleSpinner.selectedItemPosition) {
-                1 -> ContentScale.FILL
-                2 -> ContentScale.FULL_BLEED_FILL
-                3 -> ContentScale.PRINTABLE_FIT
-                4 -> ContentScale.ACTUAL
-                else -> ContentScale.FIT
+            scale = when (ippScaling) {
+                "fill" -> ContentScale.FILL
+                "none" -> ContentScale.ACTUAL
+                "auto-fit" -> ContentScale.SHRINK_ONLY
+                "fit", "auto" -> ContentScale.FIT
+                else -> when (contentScaleSpinner.selectedItemPosition) {
+                    1 -> ContentScale.FILL
+                    2 -> ContentScale.FULL_BLEED_FILL
+                    3 -> ContentScale.PRINTABLE_FIT
+                    4 -> ContentScale.ACTUAL
+                    else -> ContentScale.FIT
+                }
             },
             margin = contentMarginValues.getOrElse(contentMarginSpinner.selectedItemPosition) { 43 },
-            textSize = if (applyTextStyle.isChecked) {
-                contentTextSizeInput.text.toString().trim().toFloatOrNull()?.also {
-                    require(it.isFinite() && it > 0f) { "글자 크기는 0보다 큰 pt 값으로 입력하세요" }
-                } ?: error("글자 크기를 숫자로 입력하세요")
-            } else 15f,
             rasterDpi = listOf(75, 150, 300, 600, 1200)[rasterDpiSpinner.selectedItemPosition],
             postScriptJpegQuality = when (psEncodingSpinner.selectedItemPosition) { 1 -> 100; 2 -> null; else -> 90 },
             pageWidth = pageWidth,
@@ -2895,6 +2973,7 @@ class MainActivity : Activity() {
     }
 
     private fun selectedPageRanges(): List<IppRange> {
+        if (!pageRangesInput.isEnabled) return emptyList()
         val value = pageRangesInput.text.toString().trim()
         if (value.isBlank()) return emptyList()
         return value.split(',').map { token ->
@@ -2907,42 +2986,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun readFileLimited(uri: Uri, limit: Int): ByteArray {
-        return contentResolver.openInputStream(uri)?.use { input ->
-            val output = ByteArrayOutputStream()
-            val buffer = ByteArray(64 * 1024)
-            var total = 0
-            while (true) {
-                val count = input.read(buffer)
-                if (count < 0) break
-                total += count
-                require(total <= limit) { "파일은 최대 ${limit / 1024 / 1024}MB까지 전송할 수 있습니다" }
-                output.write(buffer, 0, count)
-            }
-            output.toByteArray()
-        } ?: error("파일을 읽을 수 없습니다")
-    }
-
-    private fun fileDisplayName(uri: Uri): String {
-        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
-            if (cursor.moveToFirst()) return cursor.getString(0) ?: "휴대폰 파일"
-        }
-        return uri.lastPathSegment ?: "휴대폰 파일"
-    }
-
-    private fun detectMime(uri: Uri, name: String, bytes: ByteArray): String {
-        contentResolver.getType(uri)?.takeIf { it != "application/octet-stream" }?.let { return it.lowercase() }
-        if (bytes.size >= 5 && bytes.copyOfRange(0, 5).contentEquals("%PDF-".toByteArray())) return "application/pdf"
-        return when (name.substringAfterLast('.', "").lowercase()) {
-            "pdf" -> "application/pdf"; "jpg", "jpeg" -> "image/jpeg"; "png" -> "image/png"
-            "tif", "tiff" -> "image/tiff"; "txt", "csv", "log" -> "text/plain"
-            "webp" -> "image/webp"; "bmp" -> "image/bmp"; "heic" -> "image/heic"; "heif" -> "image/heif"
-            "ps" -> "application/postscript"; "pcl" -> "application/vnd.hp-pcl"
-            "pclxl" -> "application/vnd.hp-pclxl"; "pwg", "ras" -> "image/pwg-raster"
-            "urf" -> "image/urf"; "pclm" -> "application/pclm"
-            else -> "application/octet-stream"
-        }
-    }
+    private fun fileDisplayName(uri: Uri): String = filePreparer.fileDisplayName(uri)
 
     private fun requestNearbyPermission() {
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED) {
@@ -2950,7 +2994,108 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun editorTextFields(): Map<String, EditText> = linkedMapOf(
+        "address" to directPrinterAddress, "cidr" to cidr, "hostCap" to hostCap,
+        "search" to printerSearch, "url" to remoteDocumentUri, "copies" to copiesInput,
+        "ranges" to pageRangesInput,
+        "scalePercent" to contentScalePercentInput, "offsetX" to contentOffsetXInput,
+        "offsetY" to contentOffsetYInput,
+    )
+
+    private fun editorSpinners(): Map<String, Spinner> = linkedMapOf(
+        "submission" to submissionMethodSpinner, "color" to colorModeSpinner, "media" to mediaSpinner,
+        "scaling" to printScalingSpinner, "sides" to sidesSpinner, "orientation" to orientationSpinner,
+        "quality" to printQualitySpinner, "resolution" to resolutionSpinner, "numberUp" to numberUpSpinner,
+        "xPosition" to xPositionSpinner, "yPosition" to yPositionSpinner,
+        "horizontal" to contentHorizontalSpinner, "vertical" to contentVerticalSpinner,
+        "contentScale" to contentScaleSpinner, "margin" to contentMarginSpinner,
+        "dpi" to rasterDpiSpinner, "psEncoding" to psEncodingSpinner,
+    )
+
+    private fun editorChecks(): Map<String, CheckBox> = linkedMapOf(
+        "authorized" to authorized,
+        "pdfLayout" to applyLayoutToPdf, "forcePs" to forcePostScript,
+    )
+
+    // Only editor data is saved. Passwords, rendered pages and file contents stay out of the Bundle.
+    private fun saveEditorState(): Bundle = Bundle().apply {
+        putSerializable("printer", selected)
+        putString("file", selectedFile?.toString())
+        putString("fileMime", selectedFileMime)
+        putString("fileLabel", fileLabel.text.toString())
+        editorTextFields().forEach { (key, field) -> putString("text:$key", field.text.toString()) }
+        editorSpinners().forEach { (key, spinner) -> putInt("spinner:$key", spinner.selectedItemPosition) }
+        editorChecks().forEach { (key, check) -> putBoolean("check:$key", check.isChecked) }
+        expandablePanels.forEach { (key, views) -> putBoolean("panel:$key", views.first.visibility == View.VISIBLE) }
+        putInt("scrollY", mainScroll.scrollY)
+        val work = PrintWorkManager.state
+        if (work?.phase == PrintWorkPhase.WAITING_NAME) {
+            putLong("nameRequestId", work.requestId)
+            putString("nameDraft", activePrintNameInput?.text?.toString() ?: pendingPrinterAlias)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun restoreEditorState(editor: Bundle?) {
+        restoringEditor = true
+        try {
+            val activeWork = PrintWorkManager.state?.takeIf { printGate.isActive(it.requestId) }
+            selected = (editor?.getSerializable("printer") as? PrinterRecord) ?: activeWork?.request?.printer
+            selectedFile = editor?.getString("file")?.let(Uri::parse) ?: if (editor == null) activeWork?.request?.file else null
+            selectedFileMime = editor?.getString("fileMime")
+            selected?.let { printer ->
+                upsertPrinter(printer)
+                showSelectedPrinter(printer)
+            }
+            editorTextFields().forEach { (key, field) ->
+                editor?.getString("text:$key")?.let(field::setText)
+            }
+            if (editor == null) activeWork?.request?.remoteUri?.let(remoteDocumentUri::setText)
+            fileLabel.text = editor?.getString("fileLabel") ?: selectedFile?.let {
+                runCatching { fileDisplayName(it) }.getOrDefault("선택한 파일")
+            } ?: "선택한 파일이 없습니다"
+            configurePageControls(selected)
+            editorSpinners().forEach { (key, spinner) ->
+                if (editor?.containsKey("spinner:$key") == true) {
+                    spinner.setSelection(editor.getInt("spinner:$key").coerceIn(0, (spinner.count - 1).coerceAtLeast(0)))
+                }
+            }
+            editorChecks().forEach { (key, check) ->
+                if (editor?.containsKey("check:$key") == true) check.isChecked = editor.getBoolean("check:$key")
+            }
+            expandablePanels.forEach { (key, views) ->
+                if (editor?.containsKey("panel:$key") == true) {
+                    val open = editor.getBoolean("panel:$key")
+                    views.first.visibility = if (open) View.VISIBLE else View.GONE
+                    views.second.text = "$key  ${if (open) "−" else "＋"}"
+                }
+            }
+            updateSavedPrintersExpander()
+            if (activeWork?.requestId == editor?.getLong("nameRequestId")) {
+                pendingPrinterAlias = editor?.getString("nameDraft")
+            }
+            updateDocumentInputAvailability()
+        } finally {
+            restoringEditor = false
+        }
+        configurePageControls(selected)
+        selectedFile?.let { inspectSelectedDocument() }
+        val scrollY = editor?.getInt("scrollY") ?: 0
+        mainScroll.post { if (!isDestroyed) mainScroll.scrollTo(0, scrollY) }
+    }
+
+    override fun onStop() {
+        retainedEditorState = saveEditorState()
+        PrintWorkManager.removeObserver(printObserverOwner)
+        super.onStop()
+    }
+
     override fun onSaveInstanceState(outState: Bundle) {
+        saveEditorState().let { editor ->
+            retainedEditorState = editor
+            outState.putBundle(STATE_EDITOR, editor)
+        }
+        outState.putBoolean(STATE_PRINT_WAS_ACTIVE, printGate.isBusy())
         lastBgpScope?.let { scope ->
             outState.putString(STATE_BGP_EGRESS, scope.egressIp)
             outState.putString(STATE_BGP_PREFIX, scope.prefix)
@@ -2959,6 +3104,13 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        recreatingUi = !isFinishing
+        PrintWorkManager.removeObserver(printObserverOwner)
+        activePrintDialog?.dismiss()
+        activePrintDialog = null
+        previewGeneration += 1
+        activePreviewDialog?.dismiss()
+        activePreviewDialog = null
         mdnsFinishRunnable?.let(main::removeCallbacks)
         mdnsCountdownRunnable?.let(main::removeCallbacks)
         networkCallback?.let { callback ->
@@ -2967,17 +3119,19 @@ class MainActivity : Activity() {
         networkCallback = null
         discovery.close()
         io.shutdownNow()
-        if (isFinishing) IppClient.clearAllCredentials()
+        if (isFinishing && !printGate.isBusy()) IppClient.clearAllCredentials()
         super.onDestroy()
     }
 
     companion object {
-        private const val MAX_FILE_BYTES = 50 * 1024 * 1024
         private const val MAX_SAVED_PRINTERS = 20
         private const val PREFS_NAME = "ipp_printer_connect"
         private const val PREF_SAVED_PRINTERS = "saved_printers_json"
         private const val PREF_LAST_PRINTED_PRINTER = "last_printed_printer_uri"
         private const val STATE_BGP_EGRESS = "bgp-egress"
         private const val STATE_BGP_PREFIX = "bgp-prefix"
+        private const val STATE_EDITOR = "editor"
+        private const val STATE_PRINT_WAS_ACTIVE = "print-was-active"
+        private var retainedEditorState: Bundle? = null
     }
 }
