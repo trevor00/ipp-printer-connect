@@ -27,6 +27,16 @@ object PrintFormatSupport {
     fun supports(formats: Collection<String>, mime: String): Boolean =
         advertisedMime(formats, mime) != null
 
+    /**
+     * 원본 MIME을 프린터가 광고하면 변환보다 원본 전송을 우선한다.
+     * 사용자가 PostScript 강제 전송을 선택한 경우에만 직접 전송을 건너뛴다.
+     */
+    fun directSubmissionMime(
+        formats: Collection<String>,
+        sourceMime: String,
+        forcePostScript: Boolean = false,
+    ): String? = if (forcePostScript) null else advertisedMime(formats, sourceMime)
+
     fun conversionLabels(formats: Collection<String>): List<String> = buildList {
         if (supports(formats, PDF)) add("사진·텍스트→PDF")
         if (supports(formats, POSTSCRIPT)) add("PDF·사진·텍스트→PostScript")

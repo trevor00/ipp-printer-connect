@@ -24,6 +24,8 @@ data class ContentLayoutOptions(
     val scale: ContentScale = ContentScale.FIT,
     val margin: Int = 43,
     val textSize: Float = 15f,
+    val rasterDpi: Int = 150,
+    val postScriptJpegQuality: Int? = 90,
     val pageWidth: Int = 595,
     val pageHeight: Int = 842,
     val scalePercent: Float = 100f,
@@ -39,9 +41,37 @@ data class ContentLayoutOptions(
 data class RenderedPreview(val bitmap: Bitmap, val pageIndex: Int, val pageCount: Int)
 
 object DocumentRenderer {
-    private const val RASTER_DPI = 150
-    private const val RASTER_PIXELS_PER_POINT = RASTER_DPI / 72f
-    private const val MAX_RASTER_PIXELS = 12_000_000f
+    // Print bitmaps use the user's exact DPI. Allocation failure never triggers lower-quality retry.
+    private fun printBitmap(widthPoints: Int, heightPoints: Int, scale: Float): Bitmap {
+        val (width, height) = RenderQuality.pixelDimensions(widthPoints, heightPoints, scale)
+        val requiredBytes = width.toLong() * height * 4
+        val runtime = Runtime.getRuntime()
+        val availableBytes = runtime.maxMemory() - (runtime.totalMemory() - runtime.freeMemory())
+        require(requiredBytes <= availableBytes) {
+            "선택한 해상도에 필요한 이미지 메모리가 부족합니다 (${width}×${height}, 약 ${requiredBytes / 1024 / 1024} MiB). 해상도를 직접 변경해 주세요. 자동 축소하지 않았습니다."
+        }
+        return try {
+            Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        } catch (_: OutOfMemoryError) {
+            error("선택한 해상도로 이미지를 만들 메모리가 부족합니다. 해상도를 직접 변경해 주세요. 자동 축소하지 않았습니다.")
+        }
+    }
+
+    private fun sourceRenderScale(width: Int, height: Int, options: ContentLayoutOptions): Float {
+        val insets = layoutInsets(options)
+        val sideways = options.rotationDegrees % 180f != 0f
+        val availableWidth = options.pageWidth - insets.left - insets.right
+        val availableHeight = options.pageHeight - insets.top - insets.bottom
+        val sourceWidth = if (sideways) height else width
+        val sourceHeight = if (sideways) width else height
+        val fit = when (options.scale) {
+            ContentScale.FILL, ContentScale.FULL_BLEED_FILL ->
+                maxOf(availableWidth / sourceWidth, availableHeight / sourceHeight)
+            ContentScale.ACTUAL -> 1f
+            else -> minOf(availableWidth / sourceWidth, availableHeight / sourceHeight)
+        }
+        return fit * options.scalePercent / 100f * options.rasterDpi / 72f
+    }
 
     private data class LayoutInsets(
         val left: Float,
@@ -70,6 +100,7 @@ object DocumentRenderer {
         numberUp: Int,
         pageWidth: Int,
         pageHeight: Int,
+        rasterDpi: Int = 150,
     ): ByteArray {
         val outputPdf = PdfDocument()
         try {
@@ -94,12 +125,8 @@ object DocumentRenderer {
                     target.canvas.drawColor(Color.WHITE)
                     indices.forEachIndexed { cellIndex, sourceIndex ->
                         renderer.openPage(sourceIndex).use { source ->
-                            val renderScale = minOf(2f, sqrt(6_000_000f / (source.width * source.height)))
-                            val bitmap = Bitmap.createBitmap(
-                                (source.width * renderScale).toInt().coerceAtLeast(1),
-                                (source.height * renderScale).toInt().coerceAtLeast(1),
-                                Bitmap.Config.ARGB_8888,
-                            )
+                            val renderScale = minOf(cellWidth / source.width, cellHeight / source.height) * rasterDpi / 72f
+                            val bitmap = printBitmap(source.width, source.height, renderScale)
                             try {
                                 Canvas(bitmap).drawColor(Color.WHITE)
                                 source.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
@@ -169,72 +196,34 @@ object DocumentRenderer {
 
     fun textPdf(title: String, text: String, options: ContentLayoutOptions = ContentLayoutOptions()): ByteArray {
         require(text.isNotBlank()) { "출력할 텍스트가 비어 있습니다" }
+        val pages = textPages(title, text, options)
         val pdf = PdfDocument()
-        val page = pdf.startPage(PdfDocument.PageInfo.Builder(options.pageWidth, options.pageHeight, 1).create())
-        val canvas = page.canvas; canvas.drawColor(Color.WHITE)
-        val printableClipSaveCount = beginPrintableClip(canvas, options)
-        val rotationSaveCount = beginContentRotation(canvas, options)
-        val effectiveTextSize = options.textSize * options.scalePercent / 100f
-        val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.BLACK; textSize = effectiveTextSize * 1.35f }
-        val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.BLACK; textSize = effectiveTextSize }
-        val insets = layoutInsets(options)
-        val maxWidth = options.pageWidth - insets.left - insets.right
-        val lineHeight = effectiveTextSize * 1.48f
-        val lines = mutableListOf<String>()
-        for (paragraph in text.replace("\r\n", "\n").split("\n")) {
-            var line = ""
-            for (character in paragraph) {
-                val candidate = line + character
-                if (line.isNotEmpty() && bodyPaint.measureText(candidate) > maxWidth) {
-                    lines += line
-                    line = character.toString()
-                } else line = candidate
+        try {
+            pages.forEachIndexed { index, lines ->
+                val page = pdf.startPage(PdfDocument.PageInfo.Builder(options.pageWidth, options.pageHeight, index + 1).create())
+                try {
+                    val canvas = page.canvas
+                    canvas.drawColor(Color.WHITE)
+                    val printableClipSaveCount = beginPrintableClip(canvas, options)
+                    val rotationSaveCount = beginContentRotation(canvas, options)
+                    drawTextPage(canvas, if (index == 0) title else "", lines, options)
+                    canvas.restoreToCount(rotationSaveCount)
+                    printableClipSaveCount?.let(canvas::restoreToCount)
+                } finally {
+                    pdf.finishPage(page)
+                }
             }
-            lines += line
+            return ByteArrayOutputStream().use { output -> pdf.writeTo(output); output.toByteArray() }
+        } finally {
+            pdf.close()
         }
-        val hasTitle = title.isNotBlank()
-        val titleGap = if (hasTitle) effectiveTextSize * 1.9f else 0f
-        val contentHeight = titleGap + lines.size * lineHeight
-        val top = when (options.vertical) {
-            ContentVertical.TOP -> insets.top
-            ContentVertical.CENTER -> ((options.pageHeight - contentHeight) / 2f).coerceAtLeast(insets.top)
-            ContentVertical.BOTTOM -> (options.pageHeight - insets.bottom - contentHeight).coerceAtLeast(insets.top)
-        } + options.offsetY
-        val align = when (options.horizontal) {
-            ContentHorizontal.LEFT -> Paint.Align.LEFT
-            ContentHorizontal.CENTER -> Paint.Align.CENTER
-            ContentHorizontal.RIGHT -> Paint.Align.RIGHT
-        }
-        val x = when (options.horizontal) {
-            ContentHorizontal.LEFT -> insets.left
-            ContentHorizontal.CENTER -> insets.left + maxWidth / 2f
-            ContentHorizontal.RIGHT -> options.pageWidth - insets.right
-        } + options.offsetX
-        titlePaint.textAlign = align
-        bodyPaint.textAlign = align
-        if (hasTitle) canvas.drawText(title.take(70), x, top + titlePaint.textSize, titlePaint)
-        var y = top + titleGap + bodyPaint.textSize
-        val bottom = options.pageHeight - insets.bottom
-        for (line in lines) {
-            if (y > bottom) break
-            canvas.drawText(line, x, y, bodyPaint)
-            y += lineHeight
-        }
-        canvas.restoreToCount(rotationSaveCount)
-        printableClipSaveCount?.let(canvas::restoreToCount)
-        pdf.finishPage(page)
-        return ByteArrayOutputStream().use { output -> pdf.writeTo(output); pdf.close(); output.toByteArray() }
     }
 
     fun imagePdf(image: ByteArray, options: ContentLayoutOptions = ContentLayoutOptions()): ByteArray {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(image, 0, image.size, bounds)
         require(bounds.outWidth > 0 && bounds.outHeight > 0) { "지원되는 이미지 파일이 아닙니다" }
-        var sample = 1
-        while ((bounds.outWidth / sample).toLong() * (bounds.outHeight / sample).toLong() > 12_000_000L) sample *= 2
-        val bitmap = BitmapFactory.decodeByteArray(
-            image, 0, image.size, BitmapFactory.Options().apply { inSampleSize = sample }
-        ) ?: error("이미지를 읽을 수 없습니다")
+        val bitmap = decodeOriginalImage(image, bounds.outWidth, bounds.outHeight)
         val pdf = PdfDocument()
         try {
             val page = pdf.startPage(PdfDocument.PageInfo.Builder(options.pageWidth, options.pageHeight, 1).create())
@@ -255,18 +244,15 @@ object DocumentRenderer {
                 require(renderer.pageCount > 0) { "PDF에 출력할 페이지가 없습니다" }
                 for (index in 0 until renderer.pageCount) {
                     renderer.openPage(index).use { sourcePage ->
-                        val renderScale = minOf(2f, kotlin.math.sqrt(12_000_000f / (sourcePage.width * sourcePage.height)))
-                        val bitmap = android.graphics.Bitmap.createBitmap(
-                            (sourcePage.width * renderScale).toInt().coerceAtLeast(1),
-                            (sourcePage.height * renderScale).toInt().coerceAtLeast(1),
-                            android.graphics.Bitmap.Config.ARGB_8888,
-                        )
+                        val renderScale = sourceRenderScale(sourcePage.width, sourcePage.height, options)
+                        val bitmap = printBitmap(sourcePage.width, sourcePage.height, renderScale)
                         try {
                             android.graphics.Canvas(bitmap).drawColor(Color.WHITE)
                             sourcePage.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
                             val targetPage = outputPdf.startPage(PdfDocument.PageInfo.Builder(options.pageWidth, options.pageHeight, index + 1).create())
                             targetPage.canvas.drawColor(Color.WHITE)
-                            drawRotatedPositionedBitmap(targetPage.canvas, bitmap, options)
+                            drawRotatedPositionedBitmap(targetPage.canvas, bitmap,
+                                if (options.scale == ContentScale.ACTUAL) options.copy(scalePercent = options.scalePercent / renderScale) else options)
                             outputPdf.finishPage(targetPage)
                         } finally {
                             bitmap.recycle()
@@ -290,13 +276,13 @@ object DocumentRenderer {
         postScriptDocument(options) { emit -> withTextPage(title, text, options, emit) }
 
     fun pdfPcl(descriptor: ParcelFileDescriptor, options: ContentLayoutOptions): ByteArray =
-        pclDocument { emit -> renderPdfPages(descriptor, options, emit) }
+        pclDocument(options) { emit -> renderPdfPages(descriptor, options, emit) }
 
     fun imagePcl(image: ByteArray, options: ContentLayoutOptions): ByteArray =
-        pclDocument { emit -> withImagePage(image, options, emit) }
+        pclDocument(options) { emit -> withImagePage(image, options, emit) }
 
     fun textPcl(title: String, text: String, options: ContentLayoutOptions): ByteArray =
-        pclDocument { emit -> withTextPage(title, text, options, emit) }
+        pclDocument(options) { emit -> withTextPage(title, text, options, emit) }
 
     fun pdfPwgRaster(descriptor: ParcelFileDescriptor, options: ContentLayoutOptions): ByteArray =
         pwgRasterDocument(options) { emit -> renderPdfPages(descriptor, options, emit) }
@@ -308,13 +294,13 @@ object DocumentRenderer {
         pwgRasterDocument(options) { emit -> withTextPage(title, text, options, emit) }
 
     fun pdfUrf(descriptor: ParcelFileDescriptor, options: ContentLayoutOptions): ByteArray =
-        urfDocument { emit -> renderPdfPages(descriptor, options, emit) }
+        urfDocument(options) { emit -> renderPdfPages(descriptor, options, emit) }
 
     fun imageUrf(image: ByteArray, options: ContentLayoutOptions): ByteArray =
-        urfDocument { emit -> withImagePage(image, options, emit) }
+        urfDocument(options) { emit -> withImagePage(image, options, emit) }
 
     fun textUrf(title: String, text: String, options: ContentLayoutOptions): ByteArray =
-        urfDocument { emit -> withTextPage(title, text, options, emit) }
+        urfDocument(options) { emit -> withTextPage(title, text, options, emit) }
 
     private fun postScriptDocument(options: ContentLayoutOptions, render: (((Bitmap) -> Unit) -> Unit)): ByteArray {
         val output = ByteArrayOutputStream()
@@ -322,16 +308,17 @@ object DocumentRenderer {
         var pageCount = 0
         render { bitmap ->
             pageCount += 1
-            writePostScriptPage(output, bitmap, pageCount, options.pageWidth, options.pageHeight)
+            writePostScriptPage(output, bitmap, pageCount, options.pageWidth, options.pageHeight, options.postScriptJpegQuality)
         }
         output.writeAscii("%%Trailer\n%%Pages: $pageCount\n%%EOF\n")
         return output.toByteArray()
     }
 
-    private fun pclDocument(render: (((Bitmap) -> Unit) -> Unit)): ByteArray {
+    private fun pclDocument(options: ContentLayoutOptions, render: (((Bitmap) -> Unit) -> Unit)): ByteArray {
         val output = ByteArrayOutputStream()
         output.writeAscii("\u001bE")
-        render { bitmap -> writePclPage(output, bitmap) }
+        RenderQuality.requirePclDpi(options.rasterDpi)
+        render { bitmap -> writePclPage(output, bitmap, options.rasterDpi) }
         output.writeAscii("\u001bE")
         return output.toByteArray()
     }
@@ -349,7 +336,7 @@ object DocumentRenderer {
         return output.toByteArray()
     }
 
-    private fun urfDocument(render: (((Bitmap) -> Unit) -> Unit)): ByteArray {
+    private fun urfDocument(options: ContentLayoutOptions, render: (((Bitmap) -> Unit) -> Unit)): ByteArray {
         val output = ByteArrayOutputStream()
         output.write(byteArrayOf('U'.code.toByte(), 'N'.code.toByte(), 'I'.code.toByte(), 'R'.code.toByte(), 'A'.code.toByte(), 'S'.code.toByte(), 'T'.code.toByte(), 0))
         output.writeIntBigEndian(0)
@@ -363,7 +350,7 @@ object DocumentRenderer {
             header[3] = 4
             putIntBigEndian(header, 12, bitmap.width)
             putIntBigEndian(header, 16, bitmap.height)
-            putIntBigEndian(header, 20, RASTER_DPI)
+            putIntBigEndian(header, 20, options.rasterDpi)
             output.write(header)
             writePackBitsRgbRows(output, bitmap)
         }
@@ -379,8 +366,8 @@ object DocumentRenderer {
         output.writeFixedString("auto")
         output.writeFixedString("sRGB_8")
         val values = IntArray(42)
-        values[5] = RASTER_DPI
-        values[6] = RASTER_DPI
+        values[5] = options.rasterDpi
+        values[6] = options.rasterDpi
         values[7] = 0
         values[8] = 0
         values[9] = bitmap.width
@@ -491,16 +478,13 @@ object DocumentRenderer {
             require(renderer.pageCount > 0) { "PDF에 출력할 페이지가 없습니다" }
             for (index in 0 until renderer.pageCount) {
                 renderer.openPage(index).use { sourcePage ->
-                    val renderScale = minOf(2f, sqrt(MAX_RASTER_PIXELS / (sourcePage.width * sourcePage.height)))
-                    val source = Bitmap.createBitmap(
-                        (sourcePage.width * renderScale).toInt().coerceAtLeast(1),
-                        (sourcePage.height * renderScale).toInt().coerceAtLeast(1),
-                        Bitmap.Config.ARGB_8888,
-                    )
+                    val renderScale = sourceRenderScale(sourcePage.width, sourcePage.height, options)
+                    val source = printBitmap(sourcePage.width, sourcePage.height, renderScale)
                     try {
                         Canvas(source).drawColor(Color.WHITE)
                         sourcePage.render(source, null, null, PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
-                        withPositionedPage(source, options, emit)
+                        withPositionedPage(source,
+                            if (options.scale == ContentScale.ACTUAL) options.copy(scalePercent = options.scalePercent / renderScale) else options, emit)
                     } finally {
                         source.recycle()
                     }
@@ -509,18 +493,27 @@ object DocumentRenderer {
         }
     }
 
+    private fun decodeOriginalImage(image: ByteArray, width: Int, height: Int): Bitmap {
+        val requiredBytes = width.toLong() * height * 4
+        val runtime = Runtime.getRuntime()
+        require(requiredBytes <= runtime.maxMemory() - (runtime.totalMemory() - runtime.freeMemory())) {
+            "원본 사진을 읽을 메모리가 부족합니다. 사진 크기를 직접 줄여 다시 선택해 주세요. 자동 축소하지 않았습니다."
+        }
+        return try {
+            BitmapFactory.decodeByteArray(image, 0, image.size, BitmapFactory.Options().apply {
+                inSampleSize = 1
+                inScaled = false
+            }) ?: error("이미지를 읽을 수 없습니다")
+        } catch (_: OutOfMemoryError) {
+            error("원본 사진을 읽을 메모리가 부족합니다. 자동 축소하지 않았습니다.")
+        }
+    }
+
     private fun withImagePage(image: ByteArray, options: ContentLayoutOptions, emit: (Bitmap) -> Unit) {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(image, 0, image.size, bounds)
         require(bounds.outWidth > 0 && bounds.outHeight > 0) { "지원되는 이미지 파일이 아닙니다" }
-        var sample = 1
-        while ((bounds.outWidth / sample).toLong() * (bounds.outHeight / sample).toLong() > MAX_RASTER_PIXELS) sample *= 2
-        val source = BitmapFactory.decodeByteArray(
-            image,
-            0,
-            image.size,
-            BitmapFactory.Options().apply { inSampleSize = sample },
-        ) ?: error("이미지를 읽을 수 없습니다")
+        val source = decodeOriginalImage(image, bounds.outWidth, bounds.outHeight)
         try {
             withPositionedPage(source, options, emit)
         } finally {
@@ -534,19 +527,20 @@ object DocumentRenderer {
         options: ContentLayoutOptions,
         emit: (Bitmap) -> Unit,
     ) {
-        require(text.isNotBlank()) { "출력할 텍스트가 비어 있습니다" }
-        val (bitmap, rasterScale) = blankRasterPage(options)
-        try {
-            val canvas = Canvas(bitmap)
-            canvas.scale(rasterScale, rasterScale)
-            val printableClipSaveCount = beginPrintableClip(canvas, options)
-            val rotationSaveCount = beginContentRotation(canvas, options)
-            drawTextPage(canvas, title, text, options)
-            canvas.restoreToCount(rotationSaveCount)
-            printableClipSaveCount?.let(canvas::restoreToCount)
-            emit(bitmap)
-        } finally {
-            bitmap.recycle()
+        textPages(title, text, options).forEachIndexed { index, lines ->
+            val (bitmap, rasterScale) = blankRasterPage(options)
+            try {
+                val canvas = Canvas(bitmap)
+                canvas.scale(rasterScale, rasterScale)
+                val printableClipSaveCount = beginPrintableClip(canvas, options)
+                val rotationSaveCount = beginContentRotation(canvas, options)
+                drawTextPage(canvas, if (index == 0) title else "", lines, options)
+                canvas.restoreToCount(rotationSaveCount)
+                printableClipSaveCount?.let(canvas::restoreToCount)
+                emit(bitmap)
+            } finally {
+                bitmap.recycle()
+            }
         }
     }
 
@@ -563,45 +557,45 @@ object DocumentRenderer {
     }
 
     private fun blankRasterPage(options: ContentLayoutOptions): Pair<Bitmap, Float> {
-        val scale = minOf(
-            RASTER_PIXELS_PER_POINT,
-            sqrt(MAX_RASTER_PIXELS / (options.pageWidth.toFloat() * options.pageHeight.toFloat())),
-        )
-        val bitmap = Bitmap.createBitmap(
-            (options.pageWidth * scale).toInt().coerceAtLeast(1),
-            (options.pageHeight * scale).toInt().coerceAtLeast(1),
-            Bitmap.Config.ARGB_8888,
-        )
+        val scale = options.rasterDpi / 72f
+        val bitmap = printBitmap(options.pageWidth, options.pageHeight, scale)
         Canvas(bitmap).drawColor(Color.WHITE)
         return bitmap to scale
     }
 
-    private fun drawTextPage(canvas: Canvas, title: String, text: String, options: ContentLayoutOptions) {
+    private fun textPages(title: String, text: String, options: ContentLayoutOptions): List<List<String>> {
+        require(text.isNotBlank()) { "출력할 텍스트가 비어 있습니다" }
+        val size = options.textSize * options.scalePercent / 100f
+        require(size.isFinite() && size > 0) { "글자 크기는 0보다 커야 합니다." }
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { textSize = size }
+        val insets = layoutInsets(options)
+        val lines = TextPagination.wrap(text, options.pageWidth - insets.left - insets.right) { paint.measureText(it) }
+        val metrics = paint.fontMetrics
+        return TextPagination.pages(
+            lines,
+            options.pageHeight - insets.top - insets.bottom - options.offsetY.coerceAtLeast(0f),
+            if (title.isNotBlank()) size * 1.9f else 0f,
+            metrics.bottom - metrics.top,
+            maxOf(size * 1.48f, metrics.bottom - metrics.top),
+        )
+    }
+
+    private fun drawTextPage(canvas: Canvas, title: String, lines: List<String>, options: ContentLayoutOptions) {
         val effectiveTextSize = options.textSize * options.scalePercent / 100f
         val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.BLACK; textSize = effectiveTextSize * 1.35f }
         val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.BLACK; textSize = effectiveTextSize }
         val insets = layoutInsets(options)
         val maxWidth = options.pageWidth - insets.left - insets.right
-        val lineHeight = effectiveTextSize * 1.48f
-        val lines = mutableListOf<String>()
-        for (paragraph in text.replace("\r\n", "\n").split("\n")) {
-            var line = ""
-            for (character in paragraph) {
-                val candidate = line + character
-                if (line.isNotEmpty() && bodyPaint.measureText(candidate) > maxWidth) {
-                    lines += line
-                    line = character.toString()
-                } else line = candidate
-            }
-            lines += line
-        }
+        val metrics = bodyPaint.fontMetrics
+        val lineHeight = maxOf(effectiveTextSize * 1.48f, metrics.bottom - metrics.top)
         val hasTitle = title.isNotBlank()
         val titleGap = if (hasTitle) effectiveTextSize * 1.9f else 0f
-        val contentHeight = titleGap + lines.size * lineHeight
+        val contentHeight = titleGap + metrics.bottom - metrics.top + (lines.size - 1).coerceAtLeast(0) * lineHeight
+        val availableHeight = options.pageHeight - insets.top - insets.bottom - options.offsetY.coerceAtLeast(0f)
         val top = when (options.vertical) {
             ContentVertical.TOP -> insets.top
-            ContentVertical.CENTER -> ((options.pageHeight - contentHeight) / 2f).coerceAtLeast(insets.top)
-            ContentVertical.BOTTOM -> (options.pageHeight - insets.bottom - contentHeight).coerceAtLeast(insets.top)
+            ContentVertical.CENTER -> insets.top + ((availableHeight - contentHeight) / 2f).coerceAtLeast(0f)
+            ContentVertical.BOTTOM -> insets.top + (availableHeight - contentHeight).coerceAtLeast(0f)
         } + options.offsetY
         val align = when (options.horizontal) {
             ContentHorizontal.LEFT -> Paint.Align.LEFT
@@ -615,11 +609,9 @@ object DocumentRenderer {
         } + options.offsetX
         titlePaint.textAlign = align
         bodyPaint.textAlign = align
-        if (hasTitle) canvas.drawText(title.take(70), x, top + titlePaint.textSize, titlePaint)
-        var y = top + titleGap + bodyPaint.textSize
-        val bottom = options.pageHeight - insets.bottom
+        if (hasTitle) canvas.drawText(title.take(70), x, top - titlePaint.fontMetrics.top, titlePaint)
+        var y = top + titleGap - metrics.top
         for (line in lines) {
-            if (y > bottom) break
             canvas.drawText(line, x, y, bodyPaint)
             y += lineHeight
         }
@@ -631,21 +623,36 @@ object DocumentRenderer {
         pageNumber: Int,
         pageWidth: Int,
         pageHeight: Int,
+        jpegQuality: Int?,
     ) {
-        val jpeg = ByteArrayOutputStream().use { encoded ->
-            check(bitmap.compress(Bitmap.CompressFormat.JPEG, 90, encoded)) { "PostScript용 JPEG 변환에 실패했습니다" }
+        val data = if (jpegQuality != null) ByteArrayOutputStream().use { encoded ->
+            require(jpegQuality in 0..100) { "JPEG 품질은 0~100이어야 합니다" }
+            check(bitmap.compress(Bitmap.CompressFormat.JPEG, jpegQuality, encoded)) { "PostScript용 JPEG 변환에 실패했습니다" }
             encoded.toByteArray()
+        } else {
+            val outputRgb = ByteArrayOutputStream()
+            val row = IntArray(bitmap.width)
+            for (y in 0 until bitmap.height) {
+                bitmap.getPixels(row, 0, bitmap.width, 0, y, bitmap.width, 1)
+                for (color in row) {
+                    outputRgb.write(Color.red(color))
+                    outputRgb.write(Color.green(color))
+                    outputRgb.write(Color.blue(color))
+                }
+            }
+            outputRgb.toByteArray()
         }
+        val imageFilter = if (jpegQuality == null) "/ASCII85Decode filter" else "/ASCII85Decode filter /DCTDecode filter"
         output.writeAscii(
             "%%Page: $pageNumber $pageNumber\n" +
                 "<< /PageSize [$pageWidth $pageHeight] >> setpagedevice\n" +
-                "gsave\n$pageWidth $pageHeight scale\n" +
+                "gsave\n/DeviceRGB setcolorspace\n$pageWidth $pageHeight scale\n" +
                 "<< /ImageType 1 /Width ${bitmap.width} /Height ${bitmap.height} " +
                 "/BitsPerComponent 8 /Decode [0 1 0 1 0 1] " +
                 "/ImageMatrix [${bitmap.width} 0 0 -${bitmap.height} 0 ${bitmap.height}] " +
-                "/DataSource currentfile /ASCII85Decode filter /DCTDecode filter >> image\n",
+                "/DataSource currentfile $imageFilter >> image\n",
         )
-        writeAscii85(output, jpeg)
+        writeAscii85(output, data)
         output.writeAscii("\ngrestore\nshowpage\n")
     }
 
@@ -684,11 +691,11 @@ object DocumentRenderer {
         output.write('>'.code)
     }
 
-    private fun writePclPage(output: ByteArrayOutputStream, bitmap: Bitmap) {
+    private fun writePclPage(output: ByteArrayOutputStream, bitmap: Bitmap, dpi: Int) {
         val rowBytes = (bitmap.width + 7) / 8
         val pixels = IntArray(bitmap.width)
         val packed = ByteArray(rowBytes)
-        output.writeAscii("\u001b&l0O\u001b*t${RASTER_DPI}R\u001b*r${bitmap.width}S\u001b*r${bitmap.height}T\u001b*r1A\u001b*b0M")
+        output.writeAscii("\u001b&l0O\u001b*t${dpi}R\u001b*r${bitmap.width}S\u001b*r${bitmap.height}T\u001b*r1A\u001b*b0M")
         for (y in 0 until bitmap.height) {
             java.util.Arrays.fill(packed, 0)
             bitmap.getPixels(pixels, 0, bitmap.width, 0, y, bitmap.width, 1)

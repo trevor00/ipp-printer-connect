@@ -118,7 +118,13 @@ data class IppAuthChallenge(
         }
 }
 
-data class PreparedDocument(val bytes: ByteArray, val mime: String, val displayName: String)
+data class PreparedDocument(
+    val bytes: ByteArray,
+    val mime: String,
+    val displayName: String,
+    /** false면 프린터가 광고한 원본 MIME을 그대로 보내며 배치는 IPP 옵션에 맡긴다. */
+    val layoutBakedIn: Boolean = true,
+)
 
 data class IppResolution(val x: Int, val y: Int, val units: Int) {
     val label: String get() = if (x == y) "$x${if (units == 4) "dpcm" else "dpi"}" else "${x}×${y}${if (units == 4) "dpcm" else "dpi"}"

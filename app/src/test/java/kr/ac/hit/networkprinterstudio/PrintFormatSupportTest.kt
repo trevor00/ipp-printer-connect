@@ -30,10 +30,53 @@ class PrintFormatSupportTest {
     }
 
     @Test
+    fun supportedOriginalMimeTakesPriorityOverConversionBackends() {
+        assertEquals(
+            "text/plain",
+            PrintFormatSupport.directSubmissionMime(samsungFormats, "text/plain"),
+        )
+        assertEquals(
+            "image/jpeg",
+            PrintFormatSupport.directSubmissionMime(
+                listOf("application/postscript", "image/jpeg", "application/pdf"),
+                "image/jpeg",
+            ),
+        )
+        assertEquals(
+            "application/pdf",
+            PrintFormatSupport.directSubmissionMime(
+                listOf("application/postscript", "application/pdf"),
+                "application/pdf",
+            ),
+        )
+    }
+
+    @Test
+    fun conversionIsUsedOnlyWhenOriginalMimeIsMissingOrPostscriptIsForced() {
+        assertEquals(null, PrintFormatSupport.directSubmissionMime(samsungFormats, "application/pdf"))
+        assertEquals(
+            null,
+            PrintFormatSupport.directSubmissionMime(samsungFormats, "text/plain", forcePostScript = true),
+        )
+    }
+
+    @Test
     fun reportsAvailableConversionBackends() {
         val labels = PrintFormatSupport.conversionLabels(samsungFormats)
         assertTrue(labels.any { it.contains("PostScript") })
         assertTrue(labels.any { it.contains("PCL") })
+    }
+
+    @Test
+    fun textFileCanBeSubmittedWithoutAnyConversionBackend() {
+        assertEquals("text/plain", PrintFormatSupport.directSubmissionMime(listOf("text/plain"), "text/plain"))
+    }
+
+    @Test
+    fun textFileStillHasConversionCandidatesWhenOriginalIsNotSupported() {
+        val formats = listOf(PrintFormatSupport.PDF, PrintFormatSupport.POSTSCRIPT, PrintFormatSupport.PWG_RASTER, PrintFormatSupport.URF, PrintFormatSupport.PCL)
+        assertEquals(null, PrintFormatSupport.directSubmissionMime(formats, "text/plain"))
+        assertEquals(5, PrintFormatSupport.conversionLabels(formats).count { it.contains("텍스트") })
     }
 
     @Test
