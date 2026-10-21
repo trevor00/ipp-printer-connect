@@ -93,4 +93,73 @@ class DocumentOutputPlannerTest {
         assertEquals(PrintFormatSupport.URF, plan.mime)
         assertTrue(plan.renderPages)
     }
+
+    @Test fun colorConversionSkipsMonochromePclForSupportedImageFormats() {
+        for (colorMode in listOf("color", "auto-color", "process-color", "full-color", "highlight", "auto", " COLOR ")) {
+            for (imageMime in listOf("image/png", "image/jpeg")) {
+                val plan = DocumentOutputPlanner.plan(listOf(PrintFormatSupport.PCL, imageMime), PrintFormatSupport.PDF, false, false, colorMode)
+                assertEquals("$colorMode / $imageMime", imageMime, plan.mime)
+                assertTrue(plan.renderPages)
+            }
+        }
+    }
+
+    @Test fun colorConversionKeepsEverySupportedColorPathAheadOfPcl() {
+        for (mime in listOf(PrintFormatSupport.PDF, PrintFormatSupport.POSTSCRIPT, PrintFormatSupport.PWG_RASTER, PrintFormatSupport.URF)) {
+            val plan = DocumentOutputPlanner.plan(listOf(PrintFormatSupport.PCL, mime), "text/plain", true, false, "color")
+            assertEquals(mime, plan.mime)
+            assertTrue(plan.renderPages)
+        }
+    }
+
+    @Test fun colorCannotSilentlyFallBackToMonochromePcl() {
+        for (source in listOf(PrintFormatSupport.PDF, "image/jpeg", "text/plain")) {
+            val result = runCatching { DocumentOutputPlanner.plan(listOf("application/PCL"), source, false, false, "color") }
+            assertTrue(result.isFailure)
+            val message = result.exceptionOrNull()?.message.orEmpty()
+            assertTrue(message.startsWith("전송 실패:"))
+            assertTrue(message.contains("컬러"))
+            assertTrue(message.contains("흑백 전용"))
+        }
+    }
+
+    @Test fun monochromeAndUnspecifiedModesKeepExistingPclPath() {
+        for (colorMode in listOf(null, "monochrome", "auto-monochrome", "process-monochrome", "bi-level", "process-bi-level")) {
+            val plan = DocumentOutputPlanner.plan(listOf(PrintFormatSupport.PCL, "image/jpeg"), PrintFormatSupport.PDF, false, false, colorMode)
+            assertEquals(PrintFormatSupport.PCL, plan.mime)
+            assertTrue(plan.renderPages)
+        }
+    }
+
+    @Test fun supportedOriginalColorFormatsAreNotNeedlesslyConverted() {
+        for (mime in listOf(PrintFormatSupport.PDF, PrintFormatSupport.POSTSCRIPT, PrintFormatSupport.PWG_RASTER, PrintFormatSupport.URF, "image/png", "image/jpeg", "text/plain")) {
+            val plan = DocumentOutputPlanner.plan(listOf(mime, PrintFormatSupport.PCL), mime, false, false, "color")
+            assertEquals(mime, plan.mime)
+            assertFalse(plan.renderPages)
+        }
+    }
+
+    @Test fun supportedOriginalPclRemainsUnchangedInColorMode() {
+        for (mime in listOf(PrintFormatSupport.PCL, PrintFormatSupport.PCL_XL, "application/PCL", "application/x-pclxl")) {
+            val plan = DocumentOutputPlanner.plan(listOf(mime, PrintFormatSupport.POSTSCRIPT), mime, false, false, "color")
+            assertEquals(mime, plan.mime)
+            assertFalse(plan.renderPages)
+        }
+    }
+
+    @Test fun originalPclStillPassesThroughWhenColorIsNotRequested() {
+        for (mime in listOf(PrintFormatSupport.PCL, PrintFormatSupport.PCL_XL)) {
+            for (colorMode in listOf(null, "monochrome")) {
+                val plan = DocumentOutputPlanner.plan(listOf(mime), mime, false, false, colorMode)
+                assertEquals(mime, plan.mime)
+                assertFalse(plan.renderPages)
+            }
+        }
+    }
+
+    @Test fun forcedPostScriptStillUsesColorCapablePostScript() {
+        val plan = DocumentOutputPlanner.plan(listOf(PrintFormatSupport.PCL, PrintFormatSupport.POSTSCRIPT), PrintFormatSupport.PDF, false, true, "color")
+        assertEquals(PrintFormatSupport.POSTSCRIPT, plan.mime)
+        assertTrue(plan.renderPages)
+    }
 }

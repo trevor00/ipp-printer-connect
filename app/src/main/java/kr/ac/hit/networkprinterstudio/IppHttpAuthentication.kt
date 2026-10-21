@@ -40,6 +40,14 @@ internal object IppHttpAuthentication {
         method: String,
         url: URL,
         body: ByteArray,
+    ): String? = authorization(challenge, credentials, method, url, MemoryDocumentData(body))
+
+    fun authorization(
+        challenge: HttpAuthChallenge,
+        credentials: IppCredentials,
+        method: String,
+        url: URL,
+        body: DocumentData,
     ): String? = when {
         challenge.scheme.equals("Basic", ignoreCase = true) ->
             basic(credentials)
@@ -59,16 +67,16 @@ internal object IppHttpAuthentication {
         credentials: IppCredentials,
         method: String,
         url: URL,
-        body: ByteArray,
+        body: DocumentData,
     ): String? {
         val realm = challenge.parameters["realm"] ?: return null
         val nonce = challenge.parameters["nonce"] ?: return null
         val algorithmToken = challenge.parameters["algorithm"] ?: "MD5"
         val algorithm = algorithmToken.uppercase(Locale.US)
-        val digestName = when {
-            algorithm.startsWith("MD5") -> "MD5"
-            algorithm.startsWith("SHA-256") -> "SHA-256"
-            algorithm.startsWith("SHA-512-256") -> "SHA-512/256"
+        val digestName = when (algorithm) {
+            "MD5", "MD5-SESS" -> "MD5"
+            "SHA-256", "SHA-256-SESS" -> "SHA-256"
+            "SHA-512-256", "SHA-512-256-SESS" -> "SHA-512/256"
             else -> return null
         }
         val charset: Charset =
@@ -105,7 +113,10 @@ internal object IppHttpAuthentication {
             ha1 = hash("$ha1:$nonce:$cnonce")
         }
         val ha2 = if (qop == "auth-int") {
-            hash("$method:$requestTarget:${hash(body)}")
+            val entityHash = body.digest(digestName).joinToString("") {
+                "%02x".format(it.toInt() and 0xff)
+            }
+            hash("$method:$requestTarget:$entityHash")
         } else {
             hash("$method:$requestTarget")
         }

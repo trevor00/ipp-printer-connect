@@ -1,0 +1,8 @@
+libjpeg-turbo 3.2.0
+https://github.com/libjpeg-turbo/libjpeg-turbo/releases/tag/3.2.0
+
+This software is based in part on the work of the Independent JPEG Group.
+
+The unmodified libjpeg API sources are statically linked into the application's
+row-based JPEG encoder. See LICENSE.md and README.ijg in this directory for
+the original copyright notices, license terms and warranty disclaimers.

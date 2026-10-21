@@ -23,8 +23,8 @@ class RenderQualityTest {
         assertTrue(runCatching { RenderQuality.pixelDimensions(Int.MAX_VALUE, Int.MAX_VALUE, 1f) }.isFailure)
     }
 
-    @Test fun pclRejectsUnsupportedDpiInsteadOfReducingIt() {
+    @Test fun pclAccepts1200DpiWithoutReducingIt() {
         RenderQuality.requirePclDpi(600)
-        assertTrue(runCatching { RenderQuality.requirePclDpi(1200) }.isFailure)
+        RenderQuality.requirePclDpi(1200)
     }
 }

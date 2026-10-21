@@ -6,6 +6,8 @@ local.properties
 # Gradle
 .gradle/
 .kotlin/
+.cxx/
+.externalNativeBuild/
 build/
 **/build/
 

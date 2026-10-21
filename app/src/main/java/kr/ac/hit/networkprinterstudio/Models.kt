@@ -75,6 +75,12 @@ data class PrinterRecord(
     val mediaRightMargins: List<Int> = emptyList(),
     val mediaTopMargins: List<Int> = emptyList(),
     val mediaBottomMargins: List<Int> = emptyList(),
+    val mediaCollections: List<IppCollection> = emptyList(),
+    val defaultMediaCollection: IppCollection? = null,
+    val pwgResolutions: List<IppResolution> = emptyList(),
+    val pwgTypes: List<String> = emptyList(),
+    val pwgSheetBack: String? = null,
+    val urfSupported: List<String> = emptyList(),
 ) : Serializable {
     val supportsPrintJob: Boolean get() = operations.contains(2)
     val supportsPrintUri: Boolean get() = operations.contains(3)
@@ -96,7 +102,10 @@ data class PrinterRecord(
 
 data class CupsPrinterEndpoint(val endpoint: PrinterEndpoint)
 
-data class IppResponse(val status: Int, val requestId: Int, val attributes: Map<String, List<Any>>)
+data class IppCollection(val attributes: Map<String, List<Any>>) : Serializable
+data class IppAttributeGroup(val tag: Int, val attributes: Map<String, List<Any>>)
+data class IppResponse(val status: Int, val requestId: Int, val attributes: Map<String, List<Any>>,
+    val groups: List<IppAttributeGroup> = emptyList())
 
 data class IppCredentials(
     val username: String,
@@ -120,12 +129,19 @@ data class IppAuthChallenge(
 }
 
 data class PreparedDocument(
-    val bytes: ByteArray,
+    val data: DocumentData,
     val mime: String,
     val displayName: String,
     /** false면 프린터가 광고한 원본 MIME을 그대로 보내며 배치는 IPP 옵션에 맡긴다. */
     val layoutBakedIn: Boolean = true,
-)
+    /** 요청 완료·실패 뒤 정리할 앱 전용 캐시 파일. 원본 URI 파일이 아니다. */
+    val temporaryFile: java.io.File? = null,
+    val pageSelectionApplied: Boolean = false,
+) : java.io.Closeable {
+    override fun close() {
+        temporaryFile?.delete()
+    }
+}
 
 data class IppResolution(val x: Int, val y: Int, val units: Int) : Serializable {
     val label: String get() = if (x == y) "$x${if (units == 4) "dpcm" else "dpi"}" else "${x}×${y}${if (units == 4) "dpcm" else "dpi"}"
@@ -173,4 +189,6 @@ data class PrintResult(
     val jobUri: String? = null,
     val authRequired: Boolean = false,
     val authChallenge: IppAuthChallenge? = null,
+    val warning: String? = null,
+    val outcomeUnknown: Boolean = false,
 )

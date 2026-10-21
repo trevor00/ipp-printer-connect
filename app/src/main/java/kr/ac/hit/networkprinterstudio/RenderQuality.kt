@@ -18,8 +18,8 @@ object RenderQuality {
     }
 
     fun requirePclDpi(dpi: Int) {
-        require(dpi in setOf(75, 100, 150, 200, 300, 600)) {
-            "현재 PCL 변환은 75·100·150·200·300·600 dpi만 지원합니다. 해상도를 직접 선택해 주세요. 자동 변경하지 않았습니다."
+        require(dpi in setOf(75, 100, 150, 200, 300, 600, 1200)) {
+            "PCL 변환 해상도는 75·100·150·200·300·600·1200 dpi 중에서 선택해 주세요."
         }
     }
 }

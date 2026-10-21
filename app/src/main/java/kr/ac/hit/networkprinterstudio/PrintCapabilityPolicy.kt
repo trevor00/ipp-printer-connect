@@ -29,7 +29,7 @@ object PrintCapabilityPolicy {
         val appLayout = appCanLayout(sourceMime, isRemoteUri)
         val printerRanges = printer?.pageRangesSupported == true
         val advertisedNumberUps = printer?.numberUps.orEmpty().filter { it >= 1 }
-        val numberUps = if (appLayout) appNumberUps + advertisedNumberUps else advertisedNumberUps
+        val numberUps = if (appLayout) appNumberUps else advertisedNumberUps
         return PageLayoutControls(
             appCanLayout = appLayout,
             pageRangesAllowed = appLayout || printerRanges,

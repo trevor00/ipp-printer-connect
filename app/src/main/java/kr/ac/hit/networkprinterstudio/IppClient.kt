@@ -81,7 +81,9 @@ object IppClient {
                     "number-up-supported", "number-up-default", "x-image-position-supported", "x-image-position-default",
                     "y-image-position-supported", "y-image-position-default",
                     "media-left-margin-supported", "media-right-margin-supported",
-                    "media-top-margin-supported", "media-bottom-margin-supported"
+                    "media-top-margin-supported", "media-bottom-margin-supported",
+                    "media-col-database", "media-col-default", "pwg-raster-document-type-supported",
+                    "pwg-raster-document-resolution-supported", "pwg-raster-document-sheet-back", "urf-supported"
                 )
                 names.forEachIndexed { index, value -> out.write(text(0x44, if (index == 0) "requested-attributes" else "", value)) }
                 out.write(0x03)
@@ -136,6 +138,12 @@ object IppClient {
                     mediaRightMargins = integers("media-right-margin-supported"),
                     mediaTopMargins = integers("media-top-margin-supported"),
                     mediaBottomMargins = integers("media-bottom-margin-supported"),
+                    mediaCollections = parsed.attributes["media-col-database"].orEmpty().filterIsInstance<IppCollection>(),
+                    defaultMediaCollection = parsed.attributes["media-col-default"]?.firstOrNull() as? IppCollection,
+                    pwgResolutions = resolutions("pwg-raster-document-resolution-supported"),
+                    pwgTypes = strings("pwg-raster-document-type-supported"),
+                    pwgSheetBack = first("pwg-raster-document-sheet-back").ifBlank { null },
+                    urfSupported = strings("urf-supported"),
                 )
             } catch (_: IppAuthenticationRequiredException) {
                 return null
@@ -212,6 +220,15 @@ object IppClient {
         jobName: String,
         options: IppJobOptions = IppJobOptions(),
         preferredMethod: JobSubmissionMethod = JobSubmissionMethod.AUTO,
+    ): PrintResult = print(printer, MemoryDocumentData(document), mime, jobName, options, preferredMethod)
+
+    fun print(
+        printer: PrinterRecord,
+        document: DocumentData,
+        mime: String,
+        jobName: String,
+        options: IppJobOptions = IppJobOptions(),
+        preferredMethod: JobSubmissionMethod = JobSubmissionMethod.AUTO,
     ): PrintResult {
         val endpoint = printer.endpoint
         if (printer.supportsValidateJob) {
@@ -262,10 +279,12 @@ object IppClient {
             val raw = send(endpoint, withHeader(PRINT_URI, id, endpoint, out), 20_000)
             if (raw.first != 200) return PrintResult(false, raw.first, null, null, "Print-URI HTTP ${raw.first}", "Print-URI")
             val parsed = parse(raw.second)
+            require(parsed.requestId == id) { "IPP 응답 번호가 요청과 다릅니다" }
             val jobId = parsed.attributes["job-id"]?.firstOrNull() as? Int
             val jobUri = parsed.attributes["job-uri"]?.firstOrNull()?.toString()
             if (isSuccessful(parsed.status) && parsed.requestId == id) {
-                PrintResult(true, raw.first, parsed.status, jobId, null, "Print-URI", jobUri)
+                require(jobId != null || !jobUri.isNullOrBlank()) { "접수 응답에 작업 식별자가 없습니다" }
+                PrintResult(true, raw.first, parsed.status, jobId, null, "Print-URI", jobUri, warning = responseWarning(parsed))
             } else {
                 ippFailureResult(endpoint, raw.first, parsed.status, "Print-URI", jobId, jobUri)
             }
@@ -283,6 +302,7 @@ object IppClient {
         val createId = requestIds.incrementAndGet()
         var jobId: Int? = null
         var jobUri: String? = null
+        var documentSubmitted = false
         try {
             val create = ByteArrayOutputStream()
             writeCommonOperationAttributes(create, endpoint, jobName)
@@ -292,11 +312,17 @@ object IppClient {
             val createRaw = send(endpoint, withHeader(CREATE_JOB, createId, endpoint, create), 10_000)
             if (createRaw.first != 200) return PrintResult(false, createRaw.first, null, null, "Create-Job HTTP ${createRaw.first}", "Create-Job + Send-URI")
             val created = parse(createRaw.second)
-            if (created.requestId != createId || !isSuccessful(created.status)) {
+            require(created.requestId == createId) { "작업 생성 응답 번호가 요청과 다릅니다" }
+            if (!isSuccessful(created.status)) {
                 return ippFailureResult(endpoint, createRaw.first, created.status, "Create-Job + Send-URI")
             }
             jobId = created.attributes["job-id"]?.firstOrNull() as? Int
             jobUri = created.attributes["job-uri"]?.firstOrNull()?.toString()
+            if (responseWarning(created) != null) {
+                cancelJob(endpoint, jobId, jobUri)
+                return PrintResult(false, createRaw.first, created.status, jobId,
+                    "문서를 보내지 않았습니다. ${responseWarning(created)}", "Create-Job", jobUri)
+            }
             if (jobId == null && jobUri.isNullOrBlank()) {
                 return PrintResult(false, createRaw.first, created.status, null, "Create-Job 응답에 job-id/job-uri가 없습니다", "Create-Job + Send-URI")
             }
@@ -311,20 +337,22 @@ object IppClient {
             sendUri.write(text(0x45, "document-uri", documentUri))
             sendUri.write(attr(0x22, "last-document", byteArrayOf(1)))
             sendUri.write(0x03)
+            documentSubmitted = true
             val sendRaw = send(endpoint, withHeader(SEND_URI, sendId, endpoint, sendUri), 20_000)
             if (sendRaw.first != 200) {
                 cancelJob(endpoint, jobId, jobUri)
                 return PrintResult(false, sendRaw.first, null, jobId, "Send-URI HTTP ${sendRaw.first}", "Create-Job + Send-URI", jobUri)
             }
             val sent = parse(sendRaw.second)
+            require(sent.requestId == sendId) { "문서 전송 응답 번호가 요청과 다릅니다" }
             if (sent.requestId != sendId || !isSuccessful(sent.status)) cancelJob(endpoint, jobId, jobUri)
             return if (isSuccessful(sent.status) && sent.requestId == sendId) {
-                PrintResult(true, sendRaw.first, sent.status, jobId, null, "Create-Job + Send-URI", jobUri)
+                PrintResult(true, sendRaw.first, sent.status, jobId, null, "Create-Job + Send-URI", jobUri, warning = responseWarning(sent))
             } else {
                 ippFailureResult(endpoint, sendRaw.first, sent.status, "Create-Job + Send-URI", jobId, jobUri)
             }
         } catch (e: Exception) {
-            if (jobId != null || !jobUri.isNullOrBlank()) cancelJob(endpoint, jobId, jobUri)
+            if (!documentSubmitted && (jobId != null || !jobUri.isNullOrBlank())) cancelJob(endpoint, jobId, jobUri)
             return exceptionPrintResult(e, "Create-Job + Send-URI", jobId, jobUri)
         }
     }
@@ -340,12 +368,16 @@ object IppClient {
             val out = ByteArrayOutputStream()
             writeCommonOperationAttributes(out, endpoint, jobName)
             out.write(text(0x49, "document-format", mime))
+            out.write(attr(0x22, "ipp-attribute-fidelity", byteArrayOf(1)))
             writeJobAttributes(out, options)
             out.write(0x03)
             val raw = send(endpoint, withHeader(VALIDATE_JOB, id, endpoint, out), 8_000)
             if (raw.first != 200) return PrintResult(false, raw.first, null, null, "Validate-Job HTTP ${raw.first}", "Validate-Job")
             val parsed = parse(raw.second)
-            if (parsed.requestId == id && isSuccessful(parsed.status)) null
+            if (parsed.requestId != id) error("IPP 사전 검사 응답 번호가 다릅니다")
+            if (parsed.status == 0 && responseWarning(parsed) == null) null
+            else if (isSuccessful(parsed.status)) PrintResult(false, raw.first, parsed.status, null,
+                "설정 변경이 필요한 작업입니다. ${responseWarning(parsed)}", "Validate-Job")
             else ippFailureResult(endpoint, raw.first, parsed.status, "Validate-Job")
         } catch (e: Exception) {
             exceptionPrintResult(e, "Validate-Job")
@@ -354,7 +386,7 @@ object IppClient {
 
     private fun printJob(
         endpoint: PrinterEndpoint,
-        document: ByteArray,
+        document: DocumentData,
         mime: String,
         jobName: String,
         options: IppJobOptions,
@@ -366,14 +398,16 @@ object IppClient {
             out.write(text(0x49, "document-format", mime))
             out.write(attr(0x22, "ipp-attribute-fidelity", byteArrayOf(1)))
             writeJobAttributes(out, options)
-            out.write(0x03); out.write(document)
-            val raw = send(endpoint, withHeader(PRINT_JOB, id, endpoint, out), 20_000)
+            out.write(0x03)
+            val raw = send(endpoint, IppRequestBody(withHeader(PRINT_JOB, id, endpoint, out), document), 20_000)
             if (raw.first != 200) return PrintResult(false, raw.first, null, null, "HTTP ${raw.first}", "Print-Job")
             val parsed = parse(raw.second)
+            require(parsed.requestId == id) { "IPP 응답 번호가 요청과 다릅니다" }
             val jobId = parsed.attributes["job-id"]?.firstOrNull() as? Int
             val jobUri = parsed.attributes["job-uri"]?.firstOrNull()?.toString()
             if (isSuccessful(parsed.status) && parsed.requestId == id) {
-                PrintResult(true, raw.first, parsed.status, jobId, null, "Print-Job", jobUri)
+                require(jobId != null || !jobUri.isNullOrBlank()) { "접수 응답에 작업 식별자가 없습니다" }
+                PrintResult(true, raw.first, parsed.status, jobId, null, "Print-Job", jobUri, warning = responseWarning(parsed))
             } else {
                 ippFailureResult(endpoint, raw.first, parsed.status, "Print-Job", jobId, jobUri)
             }
@@ -384,7 +418,7 @@ object IppClient {
 
     private fun createJobAndSendDocument(
         endpoint: PrinterEndpoint,
-        document: ByteArray,
+        document: DocumentData,
         mime: String,
         jobName: String,
         options: IppJobOptions,
@@ -392,6 +426,7 @@ object IppClient {
         val createId = requestIds.incrementAndGet()
         var jobId: Int? = null
         var jobUri: String? = null
+        var documentSubmitted = false
         try {
             val create = ByteArrayOutputStream()
             writeCommonOperationAttributes(create, endpoint, jobName)
@@ -401,11 +436,17 @@ object IppClient {
             val createRaw = send(endpoint, withHeader(CREATE_JOB, createId, endpoint, create), 10_000)
             if (createRaw.first != 200) return PrintResult(false, createRaw.first, null, null, "Create-Job HTTP ${createRaw.first}", "Create-Job + Send-Document")
             val created = parse(createRaw.second)
-            if (created.requestId != createId || !isSuccessful(created.status)) {
+            require(created.requestId == createId) { "작업 생성 응답 번호가 요청과 다릅니다" }
+            if (!isSuccessful(created.status)) {
                 return ippFailureResult(endpoint, createRaw.first, created.status, "Create-Job + Send-Document")
             }
             jobId = created.attributes["job-id"]?.firstOrNull() as? Int
             jobUri = created.attributes["job-uri"]?.firstOrNull()?.toString()
+            if (responseWarning(created) != null) {
+                cancelJob(endpoint, jobId, jobUri)
+                return PrintResult(false, createRaw.first, created.status, jobId,
+                    "문서를 보내지 않았습니다. ${responseWarning(created)}", "Create-Job", jobUri)
+            }
             if (jobId == null && jobUri.isNullOrBlank()) {
                 return PrintResult(false, createRaw.first, created.status, null, "Create-Job 응답에 job-id/job-uri가 없습니다", "Create-Job + Send-Document")
             }
@@ -420,21 +461,23 @@ object IppClient {
             sendDocument.write(text(0x42, "document-name", jobName.take(120)))
             sendDocument.write(text(0x49, "document-format", mime))
             sendDocument.write(attr(0x22, "last-document", byteArrayOf(1)))
-            sendDocument.write(0x03); sendDocument.write(document)
-            val sendRaw = send(endpoint, withHeader(SEND_DOCUMENT, sendId, endpoint, sendDocument), 20_000)
+            sendDocument.write(0x03)
+            documentSubmitted = true
+            val sendRaw = send(endpoint, IppRequestBody(withHeader(SEND_DOCUMENT, sendId, endpoint, sendDocument), document), 20_000)
             if (sendRaw.first != 200) {
                 cancelJob(endpoint, jobId, jobUri)
                 return PrintResult(false, sendRaw.first, null, jobId, "Send-Document HTTP ${sendRaw.first}", "Create-Job + Send-Document", jobUri)
             }
             val sent = parse(sendRaw.second)
+            require(sent.requestId == sendId) { "문서 전송 응답 번호가 요청과 다릅니다" }
             if (sent.requestId != sendId || !isSuccessful(sent.status)) cancelJob(endpoint, jobId, jobUri)
             return if (isSuccessful(sent.status) && sent.requestId == sendId) {
-                PrintResult(true, sendRaw.first, sent.status, jobId, null, "Create-Job + Send-Document", jobUri)
+                PrintResult(true, sendRaw.first, sent.status, jobId, null, "Create-Job + Send-Document", jobUri, warning = responseWarning(sent))
             } else {
                 ippFailureResult(endpoint, sendRaw.first, sent.status, "Create-Job + Send-Document", jobId, jobUri)
             }
         } catch (e: Exception) {
-            if (jobId != null || !jobUri.isNullOrBlank()) cancelJob(endpoint, jobId, jobUri)
+            if (!documentSubmitted && (jobId != null || !jobUri.isNullOrBlank())) cancelJob(endpoint, jobId, jobUri)
             return exceptionPrintResult(e, "Create-Job + Send-Document", jobId, jobUri)
         }
     }
@@ -495,6 +538,13 @@ object IppClient {
             write(body.toByteArray())
         }.toByteArray()
 
+    private fun responseWarning(response: IppResponse): String? {
+        val changed = response.groups.filter { it.tag == 5 }.flatMap { it.attributes.keys }.distinct()
+        if (response.status == 0 && changed.isEmpty()) return null
+        return "프린터가 설정을 무시·대체했거나 추가 상태를 반환했습니다 (IPP 0x${response.status.toString(16).padStart(4, '0')})." +
+            if (changed.isEmpty()) " 변경 항목은 응답에 없습니다." else " 확인할 항목: ${changed.joinToString()}"
+    }
+
     private fun isSuccessful(status: Int) = status in 0x0000..0x00ff
 
     private fun ippFailureResult(
@@ -548,9 +598,11 @@ object IppClient {
                 null,
                 null,
                 jobId,
-                "${error.javaClass.simpleName}: ${error.message}",
+                if (method == "Validate-Job") "사전 검사 실패: ${error.message}" else
+                    "접수 여부를 확인할 수 없습니다: ${error.message}. 중복 출력을 피하려면 프린터에서 확인한 뒤 다시 인쇄하세요.",
                 method,
                 jobUri,
+                outcomeUnknown = method != "Validate-Job",
             )
         }
 
@@ -579,7 +631,10 @@ object IppClient {
         val challenge: IppAuthChallenge,
     ) : IOException("프린터 인증 필요: ${challenge.label}")
 
-    private fun send(endpoint: PrinterEndpoint, payload: ByteArray, timeoutMs: Int): IppHttpResponse {
+    private fun send(endpoint: PrinterEndpoint, payload: ByteArray, timeoutMs: Int): IppHttpResponse =
+        send(endpoint, IppRequestBody(payload), timeoutMs)
+
+    private fun send(endpoint: PrinterEndpoint, payload: DocumentData, timeoutMs: Int): IppHttpResponse {
         val transport = if (endpoint.secure) "https" else "http"
         val url = URL("$transport://${endpoint.host}:${endpoint.port}${endpoint.path}")
         val savedCredentials = credentials[endpoint.key]
@@ -614,6 +669,8 @@ object IppClient {
                 }
                 if (retryAuthorization != null) {
                     response = sendOnce(url, payload, timeoutMs, retryAuthorization)
+                } else if (parsed.isNotEmpty()) {
+                    throw IOException("프린터의 HTTP 인증 방식을 지원하지 않습니다: ${public.label}")
                 }
             }
         }
@@ -633,7 +690,7 @@ object IppClient {
 
     private fun sendOnce(
         url: URL,
-        payload: ByteArray,
+        payload: DocumentData,
         timeoutMs: Int,
         authorization: String?,
     ): IppHttpResponse {
@@ -641,15 +698,36 @@ object IppClient {
         try {
             connection.requestMethod = "POST"; connection.connectTimeout = timeoutMs; connection.readTimeout = timeoutMs
             connection.instanceFollowRedirects = false
-            connection.doOutput = true; connection.setFixedLengthStreamingMode(payload.size)
+            connection.doOutput = true; connection.setFixedLengthStreamingMode(payload.length)
             connection.setRequestProperty("Content-Type", "application/ipp")
             connection.setRequestProperty("Accept", "application/ipp")
             if (!authorization.isNullOrBlank()) {
                 connection.setRequestProperty("Authorization", authorization)
             }
-            connection.outputStream.use { it.write(payload) }
+            try {
+                connection.outputStream.use { payload.writeTo(it) }
+            } catch (writeError: IOException) {
+                if (writeError is DocumentDataException) throw writeError
+                // A printer can reject the headers before consuming a large body.
+                // Only an explicit 401 permits an authentication retry; an uncertain
+                // network failure must never resubmit a possibly accepted print job.
+                if (runCatching { connection.responseCode }.getOrNull() != HttpURLConnection.HTTP_UNAUTHORIZED) {
+                    throw writeError
+                }
+            }
             val status = connection.responseCode
-            val body = (if (status >= 400) connection.errorStream else connection.inputStream)?.use { it.readBytes() } ?: byteArrayOf()
+            val body = (if (status >= 400) connection.errorStream else connection.inputStream)?.use { input ->
+                val output = ByteArrayOutputStream()
+                val buffer = ByteArray(8192)
+                while (true) {
+                    if (Thread.currentThread().isInterrupted) throw java.io.InterruptedIOException("전송 확인이 취소되었습니다")
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    require(output.size().toLong() + count <= IppResponseParser.MAX_RESPONSE_BYTES) { "프린터 응답이 처리 가능한 크기를 초과했습니다" }
+                    output.write(buffer, 0, count)
+                }
+                output.toByteArray()
+            } ?: byteArrayOf()
             val authenticateHeaders = connection.headerFields
                 .filterKeys { it?.equals("WWW-Authenticate", ignoreCase = true) == true }
                 .values
@@ -658,39 +736,7 @@ object IppClient {
         } finally { connection.disconnect() }
     }
 
-    fun parse(data: ByteArray): IppResponse {
-        require(data.size >= 8) { "short IPP response" }
-        val buffer = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
-        buffer.get(); buffer.get(); val status = buffer.short.toInt() and 0xffff; val id = buffer.int
-        val attrs = linkedMapOf<String, MutableList<Any>>(); var current = ""
-        while (buffer.hasRemaining()) {
-            val tag = buffer.get().toInt() and 255
-            if (tag == 0x03) break
-            if (tag <= 0x0f) { current = ""; continue }
-            if (buffer.remaining() < 2) break
-            val nameLength = buffer.short.toInt() and 0xffff
-            if (buffer.remaining() < nameLength + 2) break
-            if (nameLength > 0) { val bytes = ByteArray(nameLength); buffer.get(bytes); current = bytes.toString(Charsets.UTF_8) }
-            val valueLength = buffer.short.toInt() and 0xffff
-            if (buffer.remaining() < valueLength) break
-            val bytes = ByteArray(valueLength); buffer.get(bytes)
-            if (current.isNotBlank()) {
-                val value: Any = when {
-                    (tag == 0x21 || tag == 0x23) && bytes.size == 4 -> ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN).int
-                    tag == 0x22 && bytes.size == 1 -> bytes[0].toInt() != 0
-                    tag == 0x32 && bytes.size == 9 -> ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN).let {
-                        IppResolution(it.int, it.int, it.get().toInt() and 0xff)
-                    }
-                    tag == 0x33 && bytes.size == 8 -> ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN).let {
-                        IppRange(it.int, it.int)
-                    }
-                    else -> bytes.toString(Charsets.UTF_8)
-                }
-                attrs.getOrPut(current) { mutableListOf() }.add(value)
-            }
-        }
-        return IppResponse(status, id, attrs)
-    }
+    fun parse(data: ByteArray): IppResponse = IppResponseParser.parse(data)
 
     private val STANDARD_VERSIONS = listOf(2 to 2, 2 to 1, 2 to 0, 1 to 1, 1 to 0)
     private const val USER_NAME = "ipp-printer-connect-android"

@@ -37,8 +37,6 @@ object PrintFormatSupport {
         return canonical in genericMimes || !mimePattern.matches(canonical)
     }
 
-    fun normalized(formats: Collection<String>): Set<String> = formats.mapTo(linkedSetOf(), ::normalize)
-
     fun advertisedMime(formats: Collection<String>, canonicalMime: String): String? {
         val canonical = normalize(canonicalMime)
         if (isGenericMime(canonical)) return null

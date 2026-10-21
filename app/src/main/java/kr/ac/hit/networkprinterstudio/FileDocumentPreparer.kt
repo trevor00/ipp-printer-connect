@@ -2,16 +2,22 @@ package kr.ac.hit.networkprinterstudio
 
 import android.content.Context
 import android.net.Uri
+import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
-import java.io.ByteArrayOutputStream
+import java.io.Closeable
+import java.io.File
+import java.io.IOException
 
 internal data class FilePreparationSettings(
     val layout: ContentLayoutOptions,
     val contentLayoutChanged: Boolean,
-    val applyPdfLayout: Boolean,
-    val forcePostScript: Boolean,
     val pageRanges: List<IppRange>,
     val numberUp: Int,
+    val colorMode: String? = null,
+    val requestedOutputMime: String? = null,
+    val expectedSourceMime: String? = null,
+    val sidesMode: String? = null,
+    val printQuality: Int? = null,
 ) {
     val sheetLayoutChanged: Boolean get() = pageRanges.isNotEmpty() || numberUp > 1
 }
@@ -25,16 +31,20 @@ internal data class PrintWorkRequest(
     val submissionMethod: JobSubmissionMethod,
 )
 
-internal data class FileDocument(
-    val name: String,
-    val originalBytes: ByteArray,
-    val plan: DocumentOutputPlan,
-    val laidOutPdf: ByteArray?,
-)
+internal data class FilePreview(
+    val pdfFile: File,
+    val layoutApplied: Boolean,
+    val printWarning: String?,
+    val colorMode: String? = null,
+    val outputMime: String? = null,
+) : Closeable {
+    override fun close() { pdfFile.delete() }
+}
 
 internal class FileDocumentPreparer(context: Context) {
     private val resolver = context.applicationContext.contentResolver
-    private val cacheDir = context.applicationContext.cacheDir
+    private val cacheDir = PrintCache.initialize(context.applicationContext)
+    init { com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context.applicationContext) }
 
     fun inspectMime(uri: Uri): String {
         val name = fileDisplayName(uri)
@@ -43,8 +53,7 @@ internal class FileDocumentPreparer(context: Context) {
             var size = 0
             while (size < buffer.size) {
                 val read = input.read(buffer, size, buffer.size - size)
-                if (read < 0) break
-                if (read == 0) break
+                if (read <= 0) break
                 size += read
             }
             buffer.copyOf(size)
@@ -52,108 +61,164 @@ internal class FileDocumentPreparer(context: Context) {
         return FileMimeDetector.detect(resolver.getType(uri), name, header)
     }
 
-    fun build(
-        printer: PrinterRecord,
-        uri: Uri,
-        settings: FilePreparationSettings,
-        forPreview: Boolean = false,
-    ): FileDocument {
-        val name = fileDisplayName(uri)
-        val bytes = readFileLimited(uri, MAX_FILE_BYTES)
-        val source = PrintFormatSupport.normalize(detectMime(uri, name, bytes))
-        val renderable = PrintCapabilityPolicy.appCanLayout(source)
-        require(renderable || !settings.contentLayoutChanged) {
-            "전송 실패: 이 파일 형식에는 앱의 내용 배치를 적용할 수 없습니다. PDF로 변환한 파일을 선택해 주세요."
-        }
-        val applyLayout = renderable && (settings.contentLayoutChanged || settings.sheetLayoutChanged ||
-            (source == PrintFormatSupport.PDF && settings.applyPdfLayout))
-        if (!renderable && !applyLayout && !settings.forcePostScript && !PrintFormatSupport.supports(printer.formats, source)) {
-            error(PrintFormatSupport.unsupportedFileMessage(name, source, printer.formats))
-        }
-        val plan = DocumentOutputPlanner.plan(printer.formats, source, applyLayout, settings.forcePostScript)
-        val pdf = if (plan.renderPages || forPreview) {
-            val pages = when {
-                source == PrintFormatSupport.PDF ->
-                    if (settings.applyPdfLayout || settings.contentLayoutChanged) {
-                        resolver.openFileDescriptor(uri, "r")?.use { descriptor ->
-                            DocumentRenderer.pdfWithLayout(descriptor, settings.layout)
-                        } ?: error("PDF 파일을 열 수 없습니다")
-                    } else bytes
-                source == "text/plain" -> DocumentRenderer.textPdf("", TextFileDecoder.decode(bytes).text, settings.layout)
-                source.startsWith("image/") -> DocumentRenderer.imagePdf(bytes, settings.layout)
-                else -> error("이 파일 형식은 앱에서 미리 볼 수 없습니다")
+    private fun needsPageLayout(source: String, settings: FilePreparationSettings): Boolean =
+        PrintCapabilityPolicy.appCanLayout(source) && (settings.contentLayoutChanged || settings.sheetLayoutChanged)
+
+    private fun detectMime(uri: Uri, name: String, source: File): String {
+        val header = source.inputStream().use { input ->
+            val bytes = ByteArray(64)
+            var count = 0
+            while (count < bytes.size) {
+                val read = input.read(bytes, count, bytes.size - count)
+                if (read <= 0) break
+                count += read
             }
-            if (plan.renderPages) applySheetOptions(pages, settings.pageRanges, settings.numberUp, settings.layout) else pages
-        } else null
-        return FileDocument(name, bytes, plan, pdf)
+            bytes.copyOf(count)
+        }
+        return PrintFormatSupport.normalize(FileMimeDetector.detect(resolver.getType(uri), name, header))
     }
 
-    fun prepare(
-        printer: PrinterRecord,
-        uri: Uri,
-        settings: FilePreparationSettings,
-    ): PreparedDocument {
-        val document = build(printer, uri, settings)
-        if (!document.plan.renderPages) {
-            return PreparedDocument(document.originalBytes, document.plan.mime, document.name, layoutBakedIn = false)
+    private fun capture(uri: Uri, workspace: DocumentWorkspace): File {
+        val input = resolver.openInputStream(uri) ?: error("선택한 파일을 열 수 없습니다")
+        return try {
+            workspace.capture(input)
+        } catch (error: IOException) {
+            if (cacheDir.usableSpace < 64 * 1024) {
+                throw IOException("문서를 준비할 휴대폰 저장 공간이 부족합니다. 저장 공간을 확보한 뒤 다시 시도해 주세요.", error)
+            }
+            throw IOException("문서 파일을 준비하지 못했습니다: ${error.message}", error)
         }
-        val pdf = document.laidOutPdf ?: error("출력할 페이지를 만들 수 없습니다")
-        val canonicalOutput = PrintFormatSupport.normalize(document.plan.mime)
-        val bytes = if (canonicalOutput == PrintFormatSupport.PDF) pdf else {
-            val temp = java.io.File.createTempFile("ipp-final-pages-", ".pdf", cacheDir)
-            try {
-                temp.outputStream().use { it.write(pdf) }
-                android.os.ParcelFileDescriptor.open(temp, android.os.ParcelFileDescriptor.MODE_READ_ONLY).use { descriptor ->
-                    DocumentRenderer.encodeLaidOutPdf(descriptor, canonicalOutput, settings.layout)
+    }
+
+    /** Preview owns only a display PDF; it is never handed to the print sender. */
+    fun preview(printer: PrinterRecord, uri: Uri, settings: FilePreparationSettings): FilePreview = synchronized(processingLock) {
+        checkNotCancelled()
+        DocumentWorkspace(cacheDir).use { workspace ->
+            val name = fileDisplayName(uri)
+            val sourceFile = capture(uri, workspace)
+            val source = detectMime(uri, name, sourceFile)
+            settings.expectedSourceMime?.let { require(source == it) { "파일 형식이 변경되었습니다. 다시 선택하세요." } }
+            require(PrintCapabilityPolicy.appCanLayout(source)) { "이 파일 형식은 앱에서 미리 볼 수 없습니다" }
+            val output = DocumentOutputPlanner.plan(printer.formats, source, needsPageLayout(source, settings),
+                false, settings.colorMode ?: printer.defaultColorMode,
+                settings.requestedOutputMime, requireExplicitOutput = true)
+            val layoutApplied = output.renderPages && (source != PrintFormatSupport.PDF || settings.contentLayoutChanged || settings.numberUp > 1)
+            val layoutWarning = if (layoutApplied) runCatching {
+                PrintLayoutSupport.optionsForLaidOutPages(printer, IppJobOptions())
+            }.exceptionOrNull()?.message else null
+            val displaySettings = settings.copy(layout = PreviewRenderPolicy.optionsForDisplay(settings.layout))
+            if (source != PrintFormatSupport.PDF) {
+                require(settings.layout.pageWidth > 1 && settings.layout.pageHeight > 1) { "미리보기에 사용할 용지 크기를 확인할 수 없습니다. 용지를 선택하세요." }
+            }
+            if (source.startsWith("image/")) {
+                ImageInputPolicy.requireSingleFrame(sourceFile, source)
+            }
+            val pages = renderPages(sourceFile, source, displaySettings, workspace, preview = true)
+            checkNotCancelled()
+            val pdf = applySheetOptions(pages, settings.copy(expectedSourceMime = source), displaySettings.layout, workspace, preview = true)
+            checkNotCancelled()
+            FilePreview(workspace.retain(pdf), layoutApplied, layoutWarning,
+                settings.colorMode ?: printer.defaultColorMode, if (output.renderPages) output.mime else null)
+        }
+    }
+
+    fun prepare(printer: PrinterRecord, uri: Uri, settings: FilePreparationSettings): PreparedDocument = synchronized(processingLock) {
+        checkNotCancelled()
+        DocumentWorkspace(cacheDir).use { workspace ->
+            val name = fileDisplayName(uri)
+            val sourceFile = capture(uri, workspace)
+            val source = detectMime(uri, name, sourceFile)
+            settings.expectedSourceMime?.let { require(source == it) { "파일 형식이 변경되었습니다. 다시 선택하세요." } }
+            val renderable = PrintCapabilityPolicy.appCanLayout(source)
+            require(renderable || !settings.contentLayoutChanged) {
+                "전송 실패: 이 파일 형식에는 앱의 내용 배치를 적용할 수 없습니다. PDF로 변환한 파일을 선택해 주세요."
+            }
+            val plan = DocumentOutputPlanner.plan(printer.formats, source, needsPageLayout(source, settings),
+                false, settings.colorMode ?: printer.defaultColorMode,
+                settings.requestedOutputMime, requireExplicitOutput = true)
+            if (!plan.renderPages) {
+                val prepared = PreparedDocument(FileDocumentData(sourceFile), plan.mime, name, false, sourceFile)
+                workspace.retain(sourceFile)
+                return@use prepared
+            }
+            require(settings.numberUp in setOf(1, 2, 4, 6, 9, 16)) { "앱에서 적용할 수 없는 모아찍기 설정입니다. 한 장당 페이지를 다시 선택하세요." }
+            val baked = source != PrintFormatSupport.PDF || settings.contentLayoutChanged || settings.numberUp > 1
+            if (baked) PrintLayoutSupport.optionsForLaidOutPages(printer, IppJobOptions())
+            PrinterOutputPolicy.rasterProblem(printer, plan.mime, settings.layout.rasterDpi.takeIf { it > 0 }, settings.sidesMode)?.let { error(it) }
+            if (source.startsWith("image/")) ImageInputPolicy.requireSingleFrame(sourceFile, source)
+            val pages = renderPages(sourceFile, source, settings, workspace, preview = false)
+            val pdf = applySheetOptions(pages, settings.copy(expectedSourceMime = source), settings.layout, workspace)
+            checkNotCancelled()
+            val mime = PrintFormatSupport.normalize(plan.mime)
+            require(mime == PrintFormatSupport.PDF || settings.layout.rasterDpi > 0) { "변환 해상도를 선택하세요" }
+            val outputFile = if (mime == PrintFormatSupport.PDF) pdf else {
+                workspace.create(".output").also { target ->
+                    target.outputStream().buffered(64 * 1024).use { output ->
+                        ParcelFileDescriptor.open(pdf, ParcelFileDescriptor.MODE_READ_ONLY).use { descriptor ->
+                            DocumentRenderer.encodeLaidOutPdfTo(descriptor, mime, settings.layout, output,
+                                settings.sidesMode ?: printer.defaultSides, settings.printQuality ?: printer.defaultPrintQuality)
+                        }
+                    }
                 }
-            } finally {
-                temp.delete()
+            }
+            val extension = when (mime) {
+                PrintFormatSupport.PDF -> "pdf"
+                PrintFormatSupport.POSTSCRIPT -> "ps"
+                PrintFormatSupport.PWG_RASTER -> "pwg"
+                PrintFormatSupport.URF -> "urf"
+                PrintFormatSupport.PCL -> "pcl"
+                "image/png" -> "png"
+                else -> "jpg"
+            }
+            val prepared = PreparedDocument(FileDocumentData(outputFile), plan.mime, "$name.$extension", baked, outputFile,
+                pageSelectionApplied = settings.pageRanges.isNotEmpty())
+            workspace.retain(outputFile)
+            prepared
+        }
+    }
+
+    private fun renderPages(
+        sourceFile: File,
+        source: String,
+        settings: FilePreparationSettings,
+        workspace: DocumentWorkspace,
+        preview: Boolean,
+    ): File {
+        checkNotCancelled()
+        settings.expectedSourceMime?.let { require(source == it) { "선택 후 파일 형식이 변경되었습니다. 파일을 다시 선택하세요." } }
+        if (source == PrintFormatSupport.PDF) {
+            if (!settings.contentLayoutChanged && !settings.sheetLayoutChanged) return sourceFile
+            return workspace.create(".pdf").also { PdfPageEditor.write(sourceFile, it, settings, cacheDir) }
+        }
+        val target = workspace.create(".pdf")
+        target.outputStream().buffered(64 * 1024).use { output ->
+            when {
+                source == "text/plain" -> TextPdfStreaming.write(sourceFile, settings.layout, output, cacheDir)
+                source.startsWith("image/") -> if (preview) DocumentRenderer.imageFilePreviewPdfTo(sourceFile, settings.layout, output)
+                    else DocumentRenderer.imageFilePdfTo(sourceFile, settings.layout, output)
+                else -> error("이 파일 형식은 앱에서 페이지를 만들 수 없습니다")
             }
         }
-        val extension = when (canonicalOutput) {
-            PrintFormatSupport.PDF -> "pdf"
-            PrintFormatSupport.POSTSCRIPT -> "ps"
-            PrintFormatSupport.PWG_RASTER -> "pwg"
-            PrintFormatSupport.URF -> "urf"
-            PrintFormatSupport.PCL -> "pcl"
-            "image/png" -> "png"
-            else -> "jpg"
-        }
-        return PreparedDocument(bytes, document.plan.mime, "${document.name}.$extension", layoutBakedIn = true)
+        return target
     }
 
     private fun applySheetOptions(
-        bytes: ByteArray,
-        pageRanges: List<IppRange>,
-        numberUp: Int,
+        sourceFile: File,
+        settings: FilePreparationSettings,
         layout: ContentLayoutOptions,
-    ): ByteArray {
-        if (pageRanges.isEmpty() && numberUp <= 1) return bytes
-        val temp = java.io.File.createTempFile("ipp-sheet-source-", ".pdf", cacheDir)
-        return try {
-            temp.outputStream().use { it.write(bytes) }
-            android.os.ParcelFileDescriptor.open(temp, android.os.ParcelFileDescriptor.MODE_READ_ONLY).use { descriptor ->
-                DocumentRenderer.imposePdf(descriptor, pageRanges, numberUp, layout.pageWidth, layout.pageHeight, layout.rasterDpi)
-            }
-        } finally {
-            temp.delete()
+        workspace: DocumentWorkspace,
+        preview: Boolean = false,
+    ): File {
+        // PDF input has already been selected and laid out in one vector-preserving pass.
+        if (settings.expectedSourceMime == PrintFormatSupport.PDF || !settings.sheetLayoutChanged) return sourceFile
+        checkNotCancelled()
+        return workspace.create(".pdf").also { target ->
+            val sheet = settings.copy(contentLayoutChanged = false, layout = layout.copy(
+                scale = ContentScale.FIT, scalePercent = 100f, offsetX = 0f, offsetY = 0f, rotationDegrees = 0f,
+                horizontal = ContentHorizontal.CENTER, vertical = ContentVertical.CENTER,
+            ))
+            PdfPageEditor.write(sourceFile, target, sheet, cacheDir)
         }
-    }
-
-    private fun readFileLimited(uri: Uri, limit: Int): ByteArray {
-        return resolver.openInputStream(uri)?.use { input ->
-            val output = ByteArrayOutputStream()
-            val buffer = ByteArray(64 * 1024)
-            var total = 0
-            while (true) {
-                val count = input.read(buffer)
-                if (count < 0) break
-                total += count
-                require(total <= limit) { "파일은 최대 ${limit / 1024 / 1024}MB까지 전송할 수 있습니다" }
-                output.write(buffer, 0, count)
-            }
-            output.toByteArray()
-        } ?: error("파일을 읽을 수 없습니다")
     }
 
     fun fileDisplayName(uri: Uri): String {
@@ -163,11 +228,11 @@ internal class FileDocumentPreparer(context: Context) {
         return uri.lastPathSegment ?: "휴대폰 파일"
     }
 
-    private fun detectMime(uri: Uri, name: String, bytes: ByteArray): String =
-        FileMimeDetector.detect(resolver.getType(uri), name, bytes)
-
-
     companion object {
-        const val MAX_FILE_BYTES = 50 * 1024 * 1024
+        private val processingLock = Any()
+
+        private fun checkNotCancelled() {
+            if (Thread.currentThread().isInterrupted) throw java.util.concurrent.CancellationException("문서 처리가 취소되었습니다")
+        }
     }
 }
