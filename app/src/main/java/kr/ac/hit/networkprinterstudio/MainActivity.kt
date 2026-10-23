@@ -275,7 +275,7 @@ class MainActivity : Activity() {
             }
         }
         networkCard.addView(savedPrintersExpander, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
-        networkCard.addView(savedPrintersPanel)
+        networkCard.addView(savedPrintersPanel, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
         refreshSavedPrinterCards()
         status = TextView(this).apply {
             text = "준비"
@@ -1766,11 +1766,17 @@ class MainActivity : Activity() {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(13), dp(12), dp(13), dp(12))
-            background = roundedBackground(
-                if (isSelected) accentSoft else Color.rgb(249, 250, 251),
-                if (isSelected) accent else line,
-                dp(13).toFloat(),
-            ).also { if (isSelected) it.setStroke(dp(2), accent) }
+            val cardFill = if (isSelected) accentSoft else Color.rgb(249, 250, 251)
+            val cardStroke = if (isSelected) accent else line
+            background = RippleDrawable(
+                ColorStateList.valueOf(Color.argb(36, 15, 23, 42)),
+                roundedBackground(cardFill, cardStroke, dp(13).toFloat()).apply {
+                    if (isSelected) setStroke(dp(2), accent)
+                },
+                roundedBackground(Color.WHITE, Color.WHITE, dp(13).toFloat()),
+            )
+            isClickable = true
+            isFocusable = true
             setOnClickListener { connectSavedPrinter(printer) }
             setOnLongClickListener {
                 copyPrinterDetails(printer.copy(name = savedName))
