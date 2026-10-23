@@ -18,6 +18,32 @@ import org.junit.Test
 /** Only ephemeral loopback sockets are used; no discovered or physical printer is contacted. */
 class IppClientStreamingTest {
     @Test
+    fun jobStatusQueriesOnlyTheSubmittedJobAndReadsAbortedState() {
+        withLoopbackServer(1, { _, request ->
+            val header = request.body.copyOfRange(0, 8).apply { this[2] = 0; this[3] = 0 }
+            fun integerAttribute(tag: Int, name: String, value: Int): ByteArray {
+                val key = name.toByteArray()
+                return byteArrayOf(tag.toByte(), 0, key.size.toByte()) + key + byteArrayOf(0, 4) +
+                    ByteBuffer.allocate(4).putInt(value).array()
+            }
+            HttpReply(200, "OK", listOf("Content-Type: application/ipp"), header + byteArrayOf(2) +
+                integerAttribute(0x23, "job-state", 8) + integerAttribute(0x21, "job-impressions-completed", 0) + byteArrayOf(3))
+        }) { endpoint, requests ->
+            val status = IppClient.getJobStatus(endpoint, 67, null)
+            assertEquals(8, status.state)
+            assertTrue(status.hasError)
+            assertEquals(0, status.impressionsCompleted)
+            val sent = requests().single().body
+            assertEquals(9, ByteBuffer.wrap(sent, 2, 2).short.toInt())
+            val attributes = IppClient.parse(sent).attributes
+            assertEquals(67, attributes["job-id"]?.single())
+            assertEquals(endpoint.uri, attributes["printer-uri"]?.single())
+            assertEquals("all", attributes["requested-attributes"]?.single())
+            assertEquals(3, sent.last().toInt())
+        }
+    }
+
+    @Test
     fun printJobStreamsTheUnchangedDocumentWithAnExactContentLength() {
         val document = ByteArray(20_017) { (it and 0xff).toByte() }
         val source = CountedSource(document)
@@ -109,7 +135,9 @@ class IppClientStreamingTest {
     private data class HttpReply(val status: Int, val reason: String, val headers: List<String>, val body: ByteArray)
 
     private fun successResponse(request: ByteArray): HttpReply {
-        val response = request.copyOfRange(0, 8) + byteArrayOf(3)
+        val jobId = byteArrayOf(0x21, 0, 6) + "job-id".toByteArray() + byteArrayOf(0, 4) +
+            ByteBuffer.allocate(4).putInt(17).array()
+        val response = request.copyOfRange(0, 8) + byteArrayOf(1, 2) + jobId + byteArrayOf(3)
         response[2] = 0
         response[3] = 0
         return HttpReply(200, "OK", listOf("Content-Type: application/ipp"), response)

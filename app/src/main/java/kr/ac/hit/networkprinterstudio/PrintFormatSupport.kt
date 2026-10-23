@@ -46,10 +46,7 @@ object PrintFormatSupport {
     fun supports(formats: Collection<String>, mime: String): Boolean =
         advertisedMime(formats, mime) != null
 
-    /**
-     * 원본 MIME을 프린터가 광고하면 변환보다 원본 전송을 우선한다.
-     * 사용자가 PostScript 강제 전송을 선택한 경우에만 직접 전송을 건너뛴다.
-     */
+    /** A directly submitted source is currently retained only for native PDF. */
     fun directSubmissionMime(
         formats: Collection<String>,
         sourceMime: String,
@@ -77,22 +74,15 @@ object PrintFormatSupport {
             if (supports(formats, "image/png")) add("PNG (한 페이지)")
             if (supports(formats, "image/jpeg")) add("JPEG (한 페이지)")
         }
-        val reason = if (isGenericMime(canonicalSource)) {
-            "'$fileName'의 파일 형식을 판별할 수 없고, 앱에서 이 파일을 인쇄 언어로 변환할 수 없습니다. " +
-                "프린터의 자동 형식 감지 광고만으로는 이 파일의 인쇄 지원 여부를 확인할 수 없습니다."
+        val reason = when {
+            isGenericMime(canonicalSource) -> "'$fileName'의 파일 형식을 확인할 수 없습니다."
+            else -> "앱에서 '$fileName' 형식($sourceMime)의 내용을 미리보기와 같은 페이지로 구성할 수 없습니다."
+        }
+        val route = if (pdfPaths.isEmpty()) {
+            " 다만 현재 프린터가 앱에서 만들 수 있는 전송 형식을 광고하지 않아, PDF로 바꾸더라도 출력할 수 없습니다."
         } else {
-            "'$fileName' 형식($sourceMime)을 프린터가 지원하지 않으며, 앱에도 이 형식의 변환 기능이 없습니다."
+            " 이 프린터는 ${pdfPaths.joinToString(", ")} 형식으로 전송할 수 있습니다."
         }
-        val suggestion = when {
-            canonicalSource == PDF && pdfPaths.isEmpty() ->
-                "또한 이 프린터가 앱이 생성할 수 있는 PDF, PostScript, PWG Raster, URF 또는 PCL 형식을 광고하지 않습니다."
-            canonicalSource == PDF ->
-                "이 프린터에는 ${pdfPaths.joinToString(", ")} 출력 경로가 있습니다. PDF 파일과 출력 설정을 확인해 주세요."
-            pdfPaths.isNotEmpty() ->
-                "문서를 PDF로 변환한 뒤 다시 선택하세요. PDF를 선택하면 ${pdfPaths.joinToString(", ")} 출력 경로로 전송을 시도할 수 있습니다."
-            else ->
-                "PDF로 바꾸더라도 현재 프린터가 앱이 생성할 수 있는 출력 형식을 광고하지 않아 인쇄가 보장되지 않습니다."
-        }
-        return "전송 실패: $reason $suggestion"
+        return "전송 실패: $reason PDF로 변환 후 다시 시도해 주세요.$route"
     }
 }

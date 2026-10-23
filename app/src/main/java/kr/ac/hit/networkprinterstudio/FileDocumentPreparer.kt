@@ -62,7 +62,7 @@ internal class FileDocumentPreparer(context: Context) {
     }
 
     private fun needsPageLayout(source: String, settings: FilePreparationSettings): Boolean =
-        PrintCapabilityPolicy.appCanLayout(source) && (settings.contentLayoutChanged || settings.sheetLayoutChanged)
+        PrintCapabilityPolicy.usesAppLayout(source, settings.contentLayoutChanged || settings.sheetLayoutChanged)
 
     private fun detectMime(uri: Uri, name: String, source: File): String {
         val header = source.inputStream().use { input ->
@@ -98,16 +98,30 @@ internal class FileDocumentPreparer(context: Context) {
             val sourceFile = capture(uri, workspace)
             val source = detectMime(uri, name, sourceFile)
             settings.expectedSourceMime?.let { require(source == it) { "파일 형식이 변경되었습니다. 다시 선택하세요." } }
-            require(PrintCapabilityPolicy.appCanLayout(source)) { "이 파일 형식은 앱에서 미리 볼 수 없습니다" }
-            val output = DocumentOutputPlanner.plan(printer.formats, source, needsPageLayout(source, settings),
+            require(PrintCapabilityPolicy.appCanLayout(source)) {
+                PrintFormatSupport.unsupportedFileMessage(name, source, printer.formats)
+            }
+            val paperFit = source == PrintFormatSupport.PDF && PdfPageEditor.needsSelectedPaperFit(
+                sourceFile, settings.layout, settings.pageRanges, cacheDir,
+            )
+            val planningSettings = if (paperFit) settings.copy(contentLayoutChanged = true) else settings
+            val output = DocumentOutputPlanner.plan(printer.formats, source, needsPageLayout(source, planningSettings),
                 false, settings.colorMode ?: printer.defaultColorMode,
-                settings.requestedOutputMime, requireExplicitOutput = true)
-            val layoutApplied = output.renderPages && (source != PrintFormatSupport.PDF || settings.contentLayoutChanged || settings.numberUp > 1)
-            val layoutWarning = if (layoutApplied) runCatching {
+                settings.requestedOutputMime, printer = printer,
+                sidesMode = settings.sidesMode ?: printer.defaultSides)
+            // If PDF itself is not an advertised input type, preview and generated
+            // printer-language output must share the selected-paper page geometry.
+            val pageSettings = if (source == PrintFormatSupport.PDF && output.mime != PrintFormatSupport.PDF &&
+                !planningSettings.contentLayoutChanged) planningSettings.copy(contentLayoutChanged = true) else planningSettings
+            val layoutApplied = output.renderPages && (source != PrintFormatSupport.PDF || pageSettings.contentLayoutChanged ||
+                settings.numberUp > 1 || settings.pageRanges.isNotEmpty() || output.mime != PrintFormatSupport.PDF)
+            val printerLayoutMustBeNeutral = source == PrintFormatSupport.PDF &&
+                settings.layout.pageWidth > 1 && settings.layout.pageHeight > 1
+            val layoutWarning = if (layoutApplied || printerLayoutMustBeNeutral) runCatching {
                 PrintLayoutSupport.optionsForLaidOutPages(printer, IppJobOptions())
             }.exceptionOrNull()?.message else null
-            val displaySettings = settings.copy(layout = PreviewRenderPolicy.optionsForDisplay(settings.layout))
-            if (source != PrintFormatSupport.PDF) {
+            val displaySettings = pageSettings.copy(layout = PreviewRenderPolicy.optionsForDisplay(pageSettings.layout))
+            if (source != PrintFormatSupport.PDF || output.mime != PrintFormatSupport.PDF) {
                 require(settings.layout.pageWidth > 1 && settings.layout.pageHeight > 1) { "미리보기에 사용할 용지 크기를 확인할 수 없습니다. 용지를 선택하세요." }
             }
             if (source.startsWith("image/")) {
@@ -115,7 +129,7 @@ internal class FileDocumentPreparer(context: Context) {
             }
             val pages = renderPages(sourceFile, source, displaySettings, workspace, preview = true)
             checkNotCancelled()
-            val pdf = applySheetOptions(pages, settings.copy(expectedSourceMime = source), displaySettings.layout, workspace, preview = true)
+            val pdf = applySheetOptions(pages, displaySettings.copy(expectedSourceMime = source), displaySettings.layout, workspace, preview = true)
             checkNotCancelled()
             FilePreview(workspace.retain(pdf), layoutApplied, layoutWarning,
                 settings.colorMode ?: printer.defaultColorMode, if (output.renderPages) output.mime else null)
@@ -129,34 +143,54 @@ internal class FileDocumentPreparer(context: Context) {
             val sourceFile = capture(uri, workspace)
             val source = detectMime(uri, name, sourceFile)
             settings.expectedSourceMime?.let { require(source == it) { "파일 형식이 변경되었습니다. 다시 선택하세요." } }
-            val renderable = PrintCapabilityPolicy.appCanLayout(source)
-            require(renderable || !settings.contentLayoutChanged) {
-                "전송 실패: 이 파일 형식에는 앱의 내용 배치를 적용할 수 없습니다. PDF로 변환한 파일을 선택해 주세요."
+            require(PrintCapabilityPolicy.appCanLayout(source)) {
+                PrintFormatSupport.unsupportedFileMessage(name, source, printer.formats)
             }
-            val plan = DocumentOutputPlanner.plan(printer.formats, source, needsPageLayout(source, settings),
+            val paperFit = source == PrintFormatSupport.PDF && PdfPageEditor.needsSelectedPaperFit(
+                sourceFile, settings.layout, settings.pageRanges, cacheDir,
+            )
+            val planningSettings = if (paperFit) settings.copy(contentLayoutChanged = true) else settings
+            val plan = DocumentOutputPlanner.plan(printer.formats, source, needsPageLayout(source, planningSettings),
                 false, settings.colorMode ?: printer.defaultColorMode,
-                settings.requestedOutputMime, requireExplicitOutput = true)
+                settings.requestedOutputMime, printer = printer,
+                sidesMode = settings.sidesMode ?: printer.defaultSides)
             if (!plan.renderPages) {
-                val prepared = PreparedDocument(FileDocumentData(sourceFile), plan.mime, name, false, sourceFile)
+                val pageSizeKnown = settings.layout.pageWidth > 1 && settings.layout.pageHeight > 1
+                val prepared = PreparedDocument(FileDocumentData(sourceFile), plan.mime, name, pageSizeKnown, sourceFile)
                 workspace.retain(sourceFile)
                 return@use prepared
             }
             require(settings.numberUp in setOf(1, 2, 4, 6, 9, 16)) { "앱에서 적용할 수 없는 모아찍기 설정입니다. 한 장당 페이지를 다시 선택하세요." }
-            val baked = source != PrintFormatSupport.PDF || settings.contentLayoutChanged || settings.numberUp > 1
+            val pageSettings = if (source == PrintFormatSupport.PDF && plan.mime != PrintFormatSupport.PDF &&
+                !planningSettings.contentLayoutChanged) planningSettings.copy(contentLayoutChanged = true) else planningSettings
+            val baked = source != PrintFormatSupport.PDF || pageSettings.contentLayoutChanged || settings.numberUp > 1 ||
+                (source == PrintFormatSupport.PDF && plan.mime != PrintFormatSupport.PDF) ||
+                (source == PrintFormatSupport.PDF && pageSettings.layout.pageWidth > 1 && pageSettings.layout.pageHeight > 1)
             if (baked) PrintLayoutSupport.optionsForLaidOutPages(printer, IppJobOptions())
-            PrinterOutputPolicy.rasterProblem(printer, plan.mime, settings.layout.rasterDpi.takeIf { it > 0 }, settings.sidesMode)?.let { error(it) }
+            val printDpi = pageSettings.layout.rasterDpi.takeIf { it > 0 } ?: AutomaticRasterPolicy.outputDpi(printer, plan.mime)
+            val printSettings = pageSettings.copy(
+                layout = pageSettings.layout.copy(rasterDpi = printDpi ?: pageSettings.layout.rasterDpi),
+            )
+            PrinterOutputPolicy.rasterProblem(printer, plan.mime, printDpi, settings.sidesMode)?.let { error(it) }
             if (source.startsWith("image/")) ImageInputPolicy.requireSingleFrame(sourceFile, source)
-            val pages = renderPages(sourceFile, source, settings, workspace, preview = false)
-            val pdf = applySheetOptions(pages, settings.copy(expectedSourceMime = source), settings.layout, workspace)
+            val pages = renderPages(
+                sourceFile,
+                source,
+                printSettings,
+                workspace,
+                preview = false,
+                jpegAsPdf = PrintFormatSupport.normalize(plan.mime) == PrintFormatSupport.PDF,
+            )
+            val pdf = applySheetOptions(pages, printSettings.copy(expectedSourceMime = source), printSettings.layout, workspace)
             checkNotCancelled()
             val mime = PrintFormatSupport.normalize(plan.mime)
-            require(mime == PrintFormatSupport.PDF || settings.layout.rasterDpi > 0) { "변환 해상도를 선택하세요" }
+            require(mime == PrintFormatSupport.PDF || printSettings.layout.rasterDpi > 0) { "자동 변환 해상도를 결정할 수 없습니다" }
             val outputFile = if (mime == PrintFormatSupport.PDF) pdf else {
                 workspace.create(".output").also { target ->
                     target.outputStream().buffered(64 * 1024).use { output ->
                         ParcelFileDescriptor.open(pdf, ParcelFileDescriptor.MODE_READ_ONLY).use { descriptor ->
-                            DocumentRenderer.encodeLaidOutPdfTo(descriptor, mime, settings.layout, output,
-                                settings.sidesMode ?: printer.defaultSides, settings.printQuality ?: printer.defaultPrintQuality)
+                            DocumentRenderer.encodeLaidOutPdfTo(descriptor, mime, printSettings.layout, output,
+                                printSettings.sidesMode ?: printer.defaultSides, printSettings.printQuality ?: printer.defaultPrintQuality)
                         }
                     }
                 }
@@ -183,6 +217,7 @@ internal class FileDocumentPreparer(context: Context) {
         settings: FilePreparationSettings,
         workspace: DocumentWorkspace,
         preview: Boolean,
+        jpegAsPdf: Boolean = false,
     ): File {
         checkNotCancelled()
         settings.expectedSourceMime?.let { require(source == it) { "선택 후 파일 형식이 변경되었습니다. 파일을 다시 선택하세요." } }
@@ -193,9 +228,12 @@ internal class FileDocumentPreparer(context: Context) {
         val target = workspace.create(".pdf")
         target.outputStream().buffered(64 * 1024).use { output ->
             when {
-                source == "text/plain" -> TextPdfStreaming.write(sourceFile, settings.layout, output, cacheDir)
-                source.startsWith("image/") -> if (preview) DocumentRenderer.imageFilePreviewPdfTo(sourceFile, settings.layout, output)
-                    else DocumentRenderer.imageFilePdfTo(sourceFile, settings.layout, output)
+                source == "text/plain" -> TextPdfStreaming.write(sourceFile, settings.layout, output, cacheDir, settings.pageRanges)
+                source.startsWith("image/") -> when {
+                    preview -> DocumentRenderer.imageFilePreviewPdfTo(sourceFile, settings.layout, output)
+                    jpegAsPdf && source == "image/jpeg" -> DocumentRenderer.jpegPhotoPdfTo(sourceFile, settings.layout, output)
+                    else -> DocumentRenderer.imageFilePdfTo(sourceFile, settings.layout, output)
+                }
                 else -> error("이 파일 형식은 앱에서 페이지를 만들 수 없습니다")
             }
         }

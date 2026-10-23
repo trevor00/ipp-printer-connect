@@ -482,6 +482,30 @@ object IppClient {
         }
     }
 
+    internal fun getJobStatus(endpoint: PrinterEndpoint, jobId: Int?, jobUri: String?): IppJobStatus {
+        require(jobId != null || !jobUri.isNullOrBlank()) { "조회할 작업 번호가 없습니다" }
+        val id = requestIds.incrementAndGet()
+        val out = ByteArrayOutputStream().apply {
+            write(0x01)
+            write(text(0x47, "attributes-charset", "utf-8"))
+            write(text(0x48, "attributes-natural-language", "ko"))
+            // Keep printer-uri and job-id adjacent; both identify the operation target.
+            writeJobTarget(this, endpoint, jobId, jobUri.takeIf { jobId == null })
+            write(text(0x42, "requesting-user-name", requestingUserName(endpoint)))
+            // Some devices reject a list containing an optional attribute they do not implement.
+            write(text(0x44, "requested-attributes", "all"))
+            write(0x03)
+        }
+        val raw = send(endpoint, withHeader(0x0009, id, endpoint, out), 5_000)
+        require(raw.first == 200) { "작업 상태 조회 HTTP ${raw.first}" }
+        val parsed = parse(raw.second)
+        require(parsed.requestId == id) { "작업 상태 응답 번호가 요청과 다릅니다" }
+        require(isSuccessful(parsed.status)) {
+            "작업 상태를 조회할 수 없습니다 (IPP 0x${parsed.status.toString(16).padStart(4, '0')})"
+        }
+        return IppJobStatus.from(parsed.attributes)
+    }
+
     private fun cancelJob(endpoint: PrinterEndpoint, jobId: Int?, jobUri: String?) = runCatching {
         val id = requestIds.incrementAndGet()
         val out = ByteArrayOutputStream()

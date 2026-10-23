@@ -15,6 +15,13 @@ object PrintCapabilityPolicy {
         "image/heic", "image/heif", "image/avif",
     )
 
+    fun isPhoto(sourceMime: String?): Boolean =
+        sourceMime != null && PrintFormatSupport.normalize(sourceMime) in photoMimes
+
+    /** Photos have no page: the preview's selected paper and layout define their printed page. */
+    fun usesAppLayout(sourceMime: String?, explicitLayout: Boolean): Boolean =
+        appCanLayout(sourceMime) && (isPhoto(sourceMime) || explicitLayout)
+
     fun appCanLayout(sourceMime: String?, isRemoteUri: Boolean = false): Boolean {
         if (isRemoteUri || sourceMime == null) return false
         val mime = PrintFormatSupport.normalize(sourceMime)
@@ -29,11 +36,12 @@ object PrintCapabilityPolicy {
         val appLayout = appCanLayout(sourceMime, isRemoteUri)
         val printerRanges = printer?.pageRangesSupported == true
         val advertisedNumberUps = printer?.numberUps.orEmpty().filter { it >= 1 }
-        val numberUps = if (appLayout) appNumberUps else advertisedNumberUps
+        val numberUps = (if (appLayout) appNumberUps + advertisedNumberUps else advertisedNumberUps)
+            .distinct().sorted()
         return PageLayoutControls(
             appCanLayout = appLayout,
             pageRangesAllowed = appLayout || printerRanges,
-            numberUpChoices = numberUps.distinct().sorted(),
+            numberUpChoices = numberUps,
             pageRangesHint = when {
                 appLayout -> "예: 1-3,5 · 앱에서 적용"
                 printerRanges -> "예: 1-3,5 · 프린터에서 적용"

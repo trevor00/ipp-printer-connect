@@ -16,8 +16,10 @@ internal object StreamingTextPagination {
         glyphHeight: Float,
         lineHeight: Float,
         measure: (String) -> Float,
+        maxPages: Int? = null,
         emit: (List<String>) -> Unit,
     ): Int {
+        require(maxPages == null || maxPages > 0) { "최대 페이지 수는 1 이상이어야 합니다." }
         require(width.isFinite() && width > 0) { "텍스트를 배치할 가로 공간이 없습니다. 여백을 확인해 주세요." }
         require(height.isFinite() && firstPageHeader.isFinite() && glyphHeight.isFinite() && lineHeight.isFinite() &&
             firstPageHeader >= 0 && glyphHeight > 0 && lineHeight > 0) { "텍스트 페이지 설정이 올바르지 않습니다." }
@@ -31,11 +33,13 @@ internal object StreamingTextPagination {
         val page = ArrayList<String>()
         val line = StringBuilder()
         var pageCount = 0
+        var stoppedAtPageLimit = false
         fun flushPage() {
             cancelled()
             emit(page.toList())
             page.clear()
             pageCount++
+            stoppedAtPageLimit = maxPages != null && pageCount >= maxPages
         }
         fun finishLine() {
             cancelled()
@@ -55,7 +59,10 @@ internal object StreamingTextPagination {
             }
             require(measure(character) <= width) { "선택한 글자 크기로 한 글자도 용지 폭에 들어가지 않습니다. 글자 크기나 여백을 확인해 주세요." }
             val candidate = line.toString() + character
-            if (line.isNotEmpty() && measure(candidate) > width) finishLine()
+            if (line.isNotEmpty() && measure(candidate) > width) {
+                finishLine()
+                if (stoppedAtPageLimit) return
+            }
             require(line.length.toLong() + character.length <= MAX_LINE_CHARACTERS) {
                 "전송 실패: 한 줄의 결합문자 등 글자 수가 처리 가능한 범위를 넘었습니다. 내용을 자르거나 글자 크기를 자동 변경하지 않았습니다. 문서를 PDF로 저장해 다시 선택해 주세요."
             }
@@ -63,7 +70,7 @@ internal object StreamingTextPagination {
         }
         val characters = CharArray(8192)
         var highSurrogate: Char? = null
-        while (true) {
+        while (!stoppedAtPageLimit) {
             cancelled()
             val count = reader.read(characters)
             cancelled()
@@ -81,12 +88,15 @@ internal object StreamingTextPagination {
                     require(!Character.isLowSurrogate(character)) { "텍스트에 올바르지 않은 유니코드 문자가 있습니다." }
                     accept(character.toString())
                 }
+                if (stoppedAtPageLimit) break
             }
         }
-        require(highSurrogate == null) { "텍스트 끝에 올바르지 않은 유니코드 문자가 있습니다." }
-        // split('\n') retains the final empty line; do not silently remove it at EOF.
-        finishLine()
-        if (page.isNotEmpty()) flushPage()
+        if (!stoppedAtPageLimit) {
+            require(highSurrogate == null) { "텍스트 끝에 올바르지 않은 유니코드 문자가 있습니다." }
+            // split('\n') retains the final empty line; do not silently remove it at EOF.
+            finishLine()
+            if (page.isNotEmpty()) flushPage()
+        }
         return pageCount
     }
 

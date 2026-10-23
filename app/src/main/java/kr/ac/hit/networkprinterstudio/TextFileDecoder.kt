@@ -2,10 +2,12 @@ package kr.ac.hit.networkprinterstudio
 
 import java.io.File
 import java.io.FilterReader
+import java.io.InputStream
 import java.io.InputStreamReader
 import java.io.InterruptedIOException
 import java.io.Reader
 import java.nio.ByteBuffer
+import java.nio.CharBuffer
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.Charset
 import java.nio.charset.CodingErrorAction
@@ -51,12 +53,44 @@ internal object TextFileDecoder {
         }
     }
 
+    /** Validates only the prefix consumed by [scan], so an explicit page range need not decode the file tail. */
+    fun validateThrough(file: File, scan: (Reader) -> Boolean): ValidatedTextSource {
+        checkInterrupted()
+        val length = file.length()
+        val modified = file.lastModified()
+        val bom = readBom(file)
+        fun result(encoding: TextFileEncoding, offset: Int): ValidatedTextSource {
+            val visible = openStrictPrefixReader(file, encoding, offset).use(scan)
+            require(file.length() == length && file.lastModified() == modified) { "검증 중 텍스트 파일이 변경되었습니다. 파일을 다시 선택해 주세요." }
+            return ValidatedTextSource(file, encoding.charsetName(), visible, encoding, offset, length, modified)
+        }
+        if (bom != null) {
+            try { return result(bom.encoding, bom.length) }
+            catch (error: CharacterCodingException) { throw decodingError(bom.encoding, error) }
+        }
+        try { return result(TextFileEncoding.UTF8, 0) }
+        catch (_: CharacterCodingException) { /* Only decoding failures allow another encoding. */ }
+        checkInterrupted()
+        try { return result(TextFileEncoding.CP949, 0) }
+        catch (error: CharacterCodingException) {
+            throw IllegalArgumentException("텍스트 인코딩을 확인할 수 없습니다. UTF-8로 저장한 파일을 다시 선택해 주세요.", error)
+        }
+    }
+
     fun openReader(source: ValidatedTextSource): Reader {
         checkInterrupted()
         require(source.file.length() == source.length && source.file.lastModified() == source.modified) {
             "검증 후 텍스트 파일이 변경되었습니다. 파일을 다시 선택해 주세요."
         }
         return strictReader(source.file, source.encoding, source.bomBytes)
+    }
+
+    fun openPrefixReader(source: ValidatedTextSource): Reader {
+        checkInterrupted()
+        require(source.file.length() == source.length && source.file.lastModified() == source.modified) {
+            "검증 후 텍스트 파일이 변경되었습니다. 파일을 다시 선택해 주세요."
+        }
+        return openStrictPrefixReader(source.file, source.encoding, source.bomBytes)
     }
 
     /** 인코딩 판별을 위해 원본 파일 전체를 별도의 바이트 배열로 복사하지 않는다. */
@@ -169,6 +203,104 @@ internal object TextFileDecoder {
         } catch (error: Throwable) {
             input.close()
             throw error
+        }
+    }
+
+    private fun openStrictPrefixReader(file: File, encoding: TextFileEncoding, offset: Int): Reader {
+        checkInterrupted()
+        val decoder = Charset.forName(if (encoding == TextFileEncoding.CP949) "MS949" else encoding.charsetName()).newDecoder()
+            .onMalformedInput(CodingErrorAction.REPORT)
+            .onUnmappableCharacter(CodingErrorAction.REPORT)
+        val input = file.inputStream().buffered()
+        try {
+            repeat(offset) {
+                checkInterrupted()
+                if (input.read() < 0) throw java.io.EOFException("텍스트 인코딩 표시를 읽는 중 파일이 끝났습니다.")
+            }
+            return PrefixDecoderReader(input, decoder)
+        } catch (error: Throwable) {
+            input.close()
+            throw error
+        }
+    }
+
+    /** Incremental decoder: unlike InputStreamReader it does not decode a large chunk past a page boundary. */
+    private class PrefixDecoderReader(
+        private val input: InputStream,
+        private val decoder: java.nio.charset.CharsetDecoder,
+    ) : Reader() {
+        private val bytes = ByteBuffer.allocate(8).apply { limit(0) }
+        private val characters = CharBuffer.allocate(2).apply { limit(0) }
+        private var endOfInput = false
+        private var decodingFinished = false
+        private var flushed = false
+        private var closed = false
+
+        override fun read(destination: CharArray, offset: Int, length: Int): Int {
+            require(offset >= 0 && length >= 0 && offset <= destination.size - length)
+            check(!closed) { "텍스트 읽기가 이미 종료되었습니다." }
+            checkInterrupted()
+            if (length == 0) return 0
+            while (true) {
+                if (characters.hasRemaining()) {
+                    characters.get(destination, offset, 1)
+                    checkInterrupted()
+                    return 1
+                }
+                if (flushed) return -1
+                characters.clear()
+                characters.limit(1)
+                if (!decodingFinished) {
+                    var result = decoder.decode(bytes, characters, endOfInput)
+                    if (result.isError) result.throwException()
+                    // A supplementary code point needs a surrogate pair. Retry only when
+                    // the decoder could not emit even one UTF-16 code unit.
+                    if (result.isOverflow && characters.position() == 0) {
+                        characters.limit(2)
+                        result = decoder.decode(bytes, characters, endOfInput)
+                        if (result.isError) result.throwException()
+                    }
+                    if (result.isUnderflow && endOfInput) decodingFinished = true
+                }
+                if (decodingFinished) {
+                    var result = decoder.flush(characters)
+                    if (result.isError) result.throwException()
+                    if (result.isOverflow && characters.position() == 0) {
+                        characters.limit(2)
+                        result = decoder.flush(characters)
+                        if (result.isError) result.throwException()
+                    }
+                    if (result.isUnderflow) flushed = true
+                } else if (characters.position() == 0) {
+                    refillBytes()
+                }
+                characters.flip()
+                if (characters.hasRemaining()) continue
+                if (flushed) return -1
+            }
+        }
+
+        private fun refillBytes() {
+            checkInterrupted()
+            bytes.compact()
+            val start = bytes.position()
+            // Feed one byte at a time so the decoder cannot reject malformed bytes
+            // immediately after the selected page before pagination reaches them.
+            val capacity = minOf(1, bytes.remaining())
+            val count = input.read(bytes.array(), start, capacity)
+            if (count < 0) endOfInput = true
+            else if (count == 0) {
+                val value = input.read()
+                if (value < 0) endOfInput = true else bytes.put(value.toByte())
+            } else bytes.position(start + count)
+            bytes.flip()
+            checkInterrupted()
+        }
+
+        override fun close() {
+            if (closed) return
+            closed = true
+            input.close()
         }
     }
 

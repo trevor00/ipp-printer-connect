@@ -87,7 +87,7 @@ class PrintFormatSupportTest {
             samsungFormats,
         )
         assertTrue(message.startsWith("전송 실패:"))
-        assertTrue(message.contains("PDF로 변환한 뒤 다시 선택하세요"))
+        assertTrue(message.contains("PDF로 변환 후 다시 시도해 주세요"))
         assertTrue(message.contains("PostScript"))
     }
 
@@ -99,8 +99,8 @@ class PrintFormatSupportTest {
             listOf("application/x-COLOR-GDI"),
         )
         assertTrue(message.startsWith("전송 실패:"))
-        assertTrue(message.contains("파일 형식을 판별할 수 없고"))
-        assertTrue(message.contains("인쇄가 보장되지 않습니다"))
+        assertTrue(message.contains("파일 형식을 확인할 수 없습니다"))
+        assertTrue(message.contains("PDF로 바꾸더라도 출력할 수 없습니다"))
     }
 
     @Test
@@ -127,7 +127,7 @@ class PrintFormatSupportTest {
             "unknown.bin", "application/octet-stream; charset=binary", samsungFormats,
         )
         assertTrue(message.startsWith("전송 실패:"))
-        assertTrue(message.contains("자동 형식 감지 광고만으로는"))
-        assertTrue(message.contains("PDF로 변환한 뒤 다시 선택하세요"))
+        assertTrue(message.contains("파일 형식을 확인할 수 없습니다"))
+        assertTrue(message.contains("PDF로 변환 후 다시 시도해 주세요"))
     }
 }

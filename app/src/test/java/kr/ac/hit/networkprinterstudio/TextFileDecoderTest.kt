@@ -227,6 +227,28 @@ class TextFileDecoderTest {
     }
 
     @Test
+    fun prefixValidationDoesNotDecodeMalformedUtf8AfterTheConsumedPrefix() {
+        val file = textFile("f".toByteArray(Charsets.UTF_8) + bytes(0xff, 0xfe, 0xfd))
+        val source = TextFileDecoder.validateThrough(file) { reader ->
+            assertEquals('f'.code, reader.read())
+            true
+        }
+        assertEquals("UTF-8", source.charsetName)
+        assertEquals('f'.code, TextFileDecoder.openPrefixReader(source).use { it.read() })
+    }
+
+    @Test
+    fun prefixValidationFallsBackToCp949WhenTheSelectedPrefixRequiresIt() {
+        val file = textFile("한글\n".toByteArray(Charset.forName("MS949")) + bytes(0xff, 0xfe))
+        val source = TextFileDecoder.validateThrough(file) { reader ->
+            assertEquals('한'.code, reader.read())
+            true
+        }
+        assertEquals("CP949", source.charsetName)
+        assertEquals('한'.code, TextFileDecoder.openPrefixReader(source).use { it.read() })
+    }
+
+    @Test
     fun invalidEncodingAndBomStillFailDuringValidation() {
         for (payload in listOf(bytes(0xff), bytes(0xef, 0xbb, 0xbf, 0xc3, 0x28), bytes(0xff, 0xfe, 0x41), bytes(0xff, 0xfe, 0, 0))) {
             val expected = runCatching { TextFileDecoder.decode(payload) }.exceptionOrNull()

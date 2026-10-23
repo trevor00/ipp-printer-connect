@@ -11,6 +11,13 @@ import android.graphics.Rect
 import android.graphics.pdf.PdfRenderer
 import android.media.ExifInterface
 import android.os.ParcelFileDescriptor
+import com.tom_roush.pdfbox.io.MemoryUsageSetting
+import com.tom_roush.pdfbox.pdmodel.PDDocument
+import com.tom_roush.pdfbox.pdmodel.PDPage
+import com.tom_roush.pdfbox.pdmodel.PDPageContentStream
+import com.tom_roush.pdfbox.pdmodel.common.PDRectangle
+import com.tom_roush.pdfbox.pdmodel.graphics.image.JPEGFactory
+import com.tom_roush.pdfbox.util.Matrix as PdfBoxMatrix
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.File
@@ -289,14 +296,64 @@ object DocumentRenderer {
         } finally { decoded.recycle() }
     }
 
+    /**
+     * Embeds the source JPEG in a page-sized PDF without resampling its pixels.
+     */
+    fun jpegPhotoPdfTo(imageFile: File, options: ContentLayoutOptions, output: OutputStream) {
+        checkNotCancelled()
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(imageFile.absolutePath, bounds)
+        require(bounds.outWidth > 0 && bounds.outHeight > 0) { "지원되는 JPEG 파일이 아닙니다" }
+        val orientation = imageOrientation(imageFile)
+        val sample = photoSampleSize(bounds.outWidth, bounds.outHeight, orientation, options)
+        val memory = MemoryUsageSetting.setupTempFileOnly().setTempDir(PrintCache.directory)
+        PDDocument(memory).use { document ->
+            val page = PDPage(PDRectangle(options.pageWidth.toFloat(), options.pageHeight.toFloat()))
+            document.addPage(page)
+            val image = if (sample == 1) {
+                imageFile.inputStream().buffered().use { JPEGFactory.createFromStream(document, it) }
+            } else {
+                val bitmap = try {
+                    BitmapFactory.decodeFile(imageFile.absolutePath, BitmapFactory.Options().apply {
+                        inSampleSize = sample
+                        inScaled = false
+                        inPreferredConfig = Bitmap.Config.ARGB_8888
+                    }) ?: error("JPEG 사진을 읽을 수 없습니다")
+                } catch (_: OutOfMemoryError) {
+                    error("선택한 용지에 맞춰 사진을 준비할 메모리가 부족합니다. 다른 앱을 닫고 다시 시도해 주세요.")
+                }
+                try {
+                    JPEGFactory.createFromImage(document, bitmap, 1f, options.rasterDpi.coerceAtLeast(1))
+                } finally {
+                    bitmap.recycle()
+                }
+            }
+            val transform = imageFileTransform(bounds.outWidth, bounds.outHeight, orientation, options)
+            val values = FloatArray(9).also(transform::getValues)
+            val bitmapWidth = if (sample == 1) bounds.outWidth else image.width
+            val bitmapHeight = if (sample == 1) bounds.outHeight else image.height
+            val scaleX = bounds.outWidth.toFloat() / bitmapWidth
+            val scaleY = bounds.outHeight.toFloat() / bitmapHeight
+            val pdfMatrix = imagePdfMatrix(values, bitmapWidth, bitmapHeight, scaleX, scaleY, options.pageHeight)
+            PDPageContentStream(document, page).use { content ->
+                content.saveGraphicsState()
+                clipPrintableArea(content, options)
+                content.drawImage(image, pdfMatrix)
+                content.restoreGraphicsState()
+            }
+            document.save(output)
+        }
+    }
+
     fun imageFilePdfTo(imageFile: File, options: ContentLayoutOptions, output: OutputStream) {
         checkNotCancelled()
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(imageFile.absolutePath, bounds)
         require(bounds.outWidth > 0 && bounds.outHeight > 0) { "지원되는 이미지 파일이 아닙니다" }
-        val orientation = try { ExifInterface(imageFile.absolutePath).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL) }
-            catch (_: IOException) { ExifInterface.ORIENTATION_NORMAL }
+        val orientation = imageOrientation(imageFile)
         val transform = imageFileTransform(bounds.outWidth, bounds.outHeight, orientation, options)
+        val sample = photoSampleSize(bounds.outWidth, bounds.outHeight, orientation, options)
+        val tileSpan = (1024L * sample).coerceAtMost(Int.MAX_VALUE.toLong()).toInt().coerceAtLeast(sample)
         StreamingRasterPdfWriter(output).use { writer ->
         val clip = if (options.scale == ContentScale.PRINTABLE_FIT) floatArrayOf(
             options.printableLeft.toFloat(), options.printableTop.toFloat(),
@@ -312,30 +369,88 @@ object DocumentRenderer {
                     var left = 0
                     while (left < bounds.outWidth) {
                         checkNotCancelled()
-                        val rectangle = Rect(left, top, minOf(left + 1024, bounds.outWidth), minOf(top + 1024, bounds.outHeight))
+                        val rectangle = Rect(left, top, minOf(left + tileSpan, bounds.outWidth), minOf(top + tileSpan, bounds.outHeight))
                         val bitmap = try {
-                            region.decodeRegion(rectangle, BitmapFactory.Options().apply { inSampleSize = 1; inScaled = false; inPreferredConfig = Bitmap.Config.ARGB_8888 })
+                            region.decodeRegion(rectangle, BitmapFactory.Options().apply { inSampleSize = sample; inScaled = false; inPreferredConfig = Bitmap.Config.ARGB_8888 })
                                 ?: error("사진의 일부 영역을 읽을 수 없습니다")
-                        } catch (_: OutOfMemoryError) { error("사진을 원본 품질로 읽을 메모리가 부족합니다. 자동 축소하지 않았습니다.") }
+                        } catch (_: OutOfMemoryError) { error("선택한 용지에 맞춰 사진을 준비할 메모리가 부족합니다. 다른 앱을 닫고 다시 시도해 주세요.") }
                         try {
-                            val tileTransform = Matrix(transform).apply { preTranslate(left.toFloat(), top.toFloat()) }
+                            val tileTransform = Matrix(transform).apply {
+                                preTranslate(left.toFloat(), top.toFloat())
+                                preScale(sample.toFloat(), sample.toFloat())
+                            }
                             val values = FloatArray(9).also(tileTransform::getValues)
                             writer.image(bitmap.width, bitmap.height, values) { writeRgbRows(it, bitmap) }
                         } finally { bitmap.recycle() }
                         left += rectangle.width()
                     }
-                    top += minOf(1024, bounds.outHeight - top)
+                    top += minOf(tileSpan, bounds.outHeight - top)
                 }
             } finally { region.recycle() }
         } else {
-            val bitmap = try { BitmapFactory.decodeFile(imageFile.absolutePath, BitmapFactory.Options().apply { inSampleSize = 1; inScaled = false })
+            val bitmap = try { BitmapFactory.decodeFile(imageFile.absolutePath, BitmapFactory.Options().apply { inSampleSize = sample; inScaled = false })
                 ?: error("이미지를 읽을 수 없습니다") }
-                catch (_: OutOfMemoryError) { error("이 이미지 형식은 영역별로 읽을 수 없으며, 원본을 읽을 메모리가 부족합니다. 자동 축소하지 않았습니다.") }
-            try { writer.image(bitmap.width, bitmap.height, FloatArray(9).also(transform::getValues)) { writeRgbRows(it, bitmap) } }
+                catch (_: OutOfMemoryError) { error("이 이미지 형식은 영역별로 읽을 수 없으며, 선택한 용지에 맞출 메모리가 부족합니다.") }
+            try {
+                val sampledTransform = Matrix(transform).apply {
+                    preScale(bounds.outWidth.toFloat() / bitmap.width, bounds.outHeight.toFloat() / bitmap.height)
+                }
+                writer.image(bitmap.width, bitmap.height, FloatArray(9).also(sampledTransform::getValues)) { writeRgbRows(it, bitmap) }
+            }
             finally { bitmap.recycle() }
         }
         writer.endPage(); writer.finish()
         }
+    }
+
+    private fun imageOrientation(imageFile: File): Int = try {
+        ExifInterface(imageFile.absolutePath).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+    } catch (_: IOException) {
+        ExifInterface.ORIENTATION_NORMAL
+    }
+
+    private fun photoSampleSize(width: Int, height: Int, orientation: Int, options: ContentLayoutOptions): Int {
+        // Page-sized PDF output defines physical placement separately; keep source pixels intact.
+        if (options.rasterDpi < 0) return 1
+        val orientedWidth = if (orientation in 5..8) height.toFloat() else width.toFloat()
+        val orientedHeight = if (orientation in 5..8) width.toFloat() else height.toFloat()
+        val rotation = Matrix().apply { setRotate(((options.rotationDegrees % 360f) + 360f) % 360f) }
+        val rotated = RectF(0f, 0f, orientedWidth, orientedHeight).also(rotation::mapRect)
+        val placed = ImageLayoutGeometry.place(rotated.width(), rotated.height(), options)
+        val visibleWidth = minOf(placed.width, options.pageWidth.toFloat())
+        val visibleHeight = minOf(placed.height, options.pageHeight.toFloat())
+        val targetLongEdge = maxOf(visibleWidth, visibleHeight) *
+            (options.rasterDpi.takeIf { it > 0 } ?: AutomaticRasterPolicy.STANDARD_DPI) / 72f
+        val sourceLongEdge = maxOf(width, height).toDouble()
+        val divisor = ceil(sourceLongEdge / targetLongEdge.coerceAtLeast(1f)).toLong()
+        return divisor.coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
+    }
+
+    private fun imagePdfMatrix(
+        values: FloatArray,
+        width: Int,
+        height: Int,
+        scaleX: Float,
+        scaleY: Float,
+        pageHeight: Int,
+    ): PdfBoxMatrix {
+        val a = values[0] * scaleX * width
+        val b = -values[3] * scaleX * width
+        val c = -values[1] * scaleY * height
+        val d = values[4] * scaleY * height
+        val e = values[1] * scaleY * height + values[2]
+        val f = pageHeight - (values[4] * scaleY * height + values[5])
+        return PdfBoxMatrix(a, b, c, d, e, f)
+    }
+
+    private fun clipPrintableArea(content: PDPageContentStream, options: ContentLayoutOptions) {
+        if (options.scale != ContentScale.PRINTABLE_FIT) return
+        val left = options.printableLeft.toFloat()
+        val bottom = (options.pageHeight - options.printableBottom).toFloat()
+        val width = (options.pageWidth - options.printableLeft - options.printableRight).toFloat()
+        val height = (options.pageHeight - options.printableTop - options.printableBottom).toFloat()
+        content.addRect(left, bottom, width, height)
+        content.clip()
     }
 
     private fun imageFileTransform(width: Int, height: Int, orientation: Int, options: ContentLayoutOptions): Matrix {

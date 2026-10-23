@@ -6,10 +6,10 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class DocumentOutputPlannerTest {
-    @Test fun unchangedSupportedTextKeepsOriginalBytes() {
+    @Test fun supportedTextUsesRenderedPagesForConsistentPreview() {
         val plan = DocumentOutputPlanner.plan(listOf("text/plain", PrintFormatSupport.POSTSCRIPT), "text/plain", false, false)
-        assertEquals("text/plain", plan.mime)
-        assertFalse(plan.renderPages)
+        assertEquals(PrintFormatSupport.POSTSCRIPT, plan.mime)
+        assertTrue(plan.renderPages)
     }
 
     @Test fun unsupportedTextConvertsWithoutLayoutEdits() {
@@ -18,10 +18,10 @@ class DocumentOutputPlannerTest {
         assertTrue(plan.renderPages)
     }
 
-    @Test fun unchangedSupportedPhotoKeepsOriginalBytes() {
+    @Test fun supportedPhotoUsesPreviewPageEvenWithoutEditedOptions() {
         val plan = DocumentOutputPlanner.plan(listOf("image/jpeg", PrintFormatSupport.POSTSCRIPT), "image/jpeg", false, false)
-        assertEquals("image/jpeg", plan.mime)
-        assertFalse(plan.renderPages)
+        assertEquals(PrintFormatSupport.POSTSCRIPT, plan.mime)
+        assertTrue(plan.renderPages)
     }
 
     @Test fun editedSupportedPhotoUsesRenderedPages() {
@@ -73,8 +73,8 @@ class DocumentOutputPlannerTest {
                 assertTrue(result.isFailure)
                 val message = result.exceptionOrNull()?.message.orEmpty()
                 assertTrue(message.startsWith("전송 실패:"))
-                assertTrue(message.contains("파일 형식을 판별할 수 없고"))
-                assertTrue(message.contains("PDF로 변환한 뒤 다시 선택하세요"))
+                assertTrue(message.contains("파일 형식을 확인할 수 없습니다"))
+                assertTrue(message.contains("PDF로 변환 후 다시 시도해 주세요"))
             }
         }
     }
@@ -84,7 +84,7 @@ class DocumentOutputPlannerTest {
             DocumentOutputPlanner.plan(listOf("image/*", PrintFormatSupport.PDF), "image/*", false, false)
         }
         assertTrue(result.isFailure)
-        assertTrue(result.exceptionOrNull()?.message.orEmpty().contains("파일 형식을 판별할 수 없고"))
+        assertTrue(result.exceptionOrNull()?.message.orEmpty().contains("파일 형식을 확인할 수 없습니다"))
     }
 
     @Test fun detectedPdfUsesRealConversionPathInsteadOfAutomaticDetection() {
@@ -131,12 +131,52 @@ class DocumentOutputPlannerTest {
         }
     }
 
-    @Test fun supportedOriginalColorFormatsAreNotNeedlesslyConverted() {
-        for (mime in listOf(PrintFormatSupport.PDF, PrintFormatSupport.POSTSCRIPT, PrintFormatSupport.PWG_RASTER, PrintFormatSupport.URF, "image/png", "image/jpeg", "text/plain")) {
+    @Test fun supportedNativePrinterLanguagesAreNotNeedlesslyConverted() {
+        for (mime in listOf(PrintFormatSupport.PDF, PrintFormatSupport.POSTSCRIPT, PrintFormatSupport.PWG_RASTER,
+            PrintFormatSupport.URF, PrintFormatSupport.PCL, PrintFormatSupport.PCL_XL)) {
             val plan = DocumentOutputPlanner.plan(listOf(mime, PrintFormatSupport.PCL), mime, false, false, "color")
             assertEquals(mime, plan.mime)
             assertFalse(plan.renderPages)
         }
+    }
+
+    @Test fun textUsesAvailablePrinterLanguageInsteadOfRawTextEvenWhenTextIsAdvertised() {
+        val plan = DocumentOutputPlanner.plan(listOf("text/plain", PrintFormatSupport.POSTSCRIPT), "text/plain",
+            false, false, "color")
+        assertEquals(PrintFormatSupport.POSTSCRIPT, plan.mime)
+        assertTrue(plan.renderPages)
+    }
+
+    @Test fun supportedPhotosUseFixedSizePdfPagesWhenAvailable() {
+        for (mime in listOf("image/jpeg", "image/png")) {
+            val plan = DocumentOutputPlanner.plan(listOf(mime, PrintFormatSupport.PDF), mime,
+                false, false, "color", requestedOutputMime = PrintFormatSupport.PDF, requireExplicitOutput = true)
+            assertEquals(PrintFormatSupport.PDF, plan.mime)
+            assertTrue(plan.renderPages)
+            assertTrue(PrintCapabilityPolicy.usesAppLayout(mime, false))
+        }
+        assertFalse(PrintCapabilityPolicy.usesAppLayout(PrintFormatSupport.PDF, false))
+        assertFalse(PrintCapabilityPolicy.usesAppLayout(PrintFormatSupport.PWG_RASTER, false))
+    }
+
+    @Test fun photoWithoutSupportedEncoderStillRequiresFormatSelection() {
+        assertTrue(runCatching {
+            DocumentOutputPlanner.plan(listOf("image/heic", PrintFormatSupport.POSTSCRIPT), "image/heic",
+                false, false, requireExplicitOutput = true)
+        }.isFailure)
+    }
+
+    @Test fun explicitPhotoOutputChoiceIsPreserved() {
+        val plan = DocumentOutputPlanner.plan(listOf("image/jpeg", PrintFormatSupport.PDF),
+            "image/jpeg", false, false, requestedOutputMime = "image/jpeg", requireExplicitOutput = true)
+        assertEquals("image/jpeg", plan.mime)
+    }
+
+    @Test fun unsupportedPhotoStillRequiresUsersFormatChoice() {
+        assertTrue(runCatching {
+            DocumentOutputPlanner.plan(listOf(PrintFormatSupport.PDF), "image/jpeg",
+                false, false, requireExplicitOutput = true)
+        }.isFailure)
     }
 
     @Test fun supportedOriginalPclRemainsUnchangedInColorMode() {

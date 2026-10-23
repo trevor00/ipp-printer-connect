@@ -5,6 +5,8 @@ import android.os.Handler
 import android.os.Looper
 import java.net.URI
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 
 internal enum class PrintWorkPhase {
     WAITING_NAME, PREPARING, CANCELLING, SENDING, AUTH_REQUIRED, ACCEPTED, FAILED, UNKNOWN, CANCELLED,
@@ -15,6 +17,9 @@ internal data class PrintWorkState(
     val request: PrintWorkRequest,
     val phase: PrintWorkPhase,
     val result: PrintResult? = null,
+    val jobStatus: IppJobStatus? = null,
+    val checkingStatus: Boolean = false,
+    val statusError: String? = null,
 )
 
 /** Keeps a single print request running while the screen is recreated. */
@@ -28,6 +33,11 @@ internal object PrintWorkManager {
     private val lock = Any()
     private val main = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor { work -> Thread(work, "ipp-print-worker") }
+    private val statusWorker = Executors.newSingleThreadScheduledExecutor { work ->
+        Thread(work, "ipp-job-status").apply { isDaemon = true }
+    }
+    private var statusTask: ScheduledFuture<*>? = null
+    private var statusGeneration = 0L
     private var runningId: Long? = null
     private var workerThread: Thread? = null
     @Volatile private var cancelRequested: Long? = null
@@ -41,6 +51,7 @@ internal object PrintWorkManager {
         val phase = journal?.getString("phase", null)
         interruptedWorkMessage = when (phase) {
             "SENDING", "UNKNOWN" -> "이전 전송의 접수 여부를 확인할 수 없습니다. 프린터에서 출력 여부를 확인한 뒤 다시 인쇄하세요."
+            "ACCEPTED" -> "이전 인쇄 요청은 접수됐지만 앱 종료로 출력 결과를 확인하지 못했습니다. 프린터에서 확인하세요."
             "PREPARING", "WAITING_NAME", "AUTH_REQUIRED" -> "앱 종료로 이전 문서 준비가 중단되었습니다. 자동으로 다시 전송하지 않습니다."
             else -> null
         }
@@ -70,6 +81,8 @@ internal object PrintWorkManager {
         val id = synchronized(lock) {
             if (gate.isBusy()) return null
             check(record(PrintWorkPhase.WAITING_NAME)) { "인쇄 작업 상태를 저장할 수 없습니다" }
+            statusGeneration += 1
+            statusTask?.cancel(false)
             interruptedWorkMessage = null
             cancelRequested = null
             val reserved = gate.tryStart() ?: return null
@@ -211,7 +224,51 @@ internal object PrintWorkManager {
             }
             record(phase)
             if (phase != PrintWorkPhase.AUTH_REQUIRED) gate.finish(id)
-            replaceStateLocked(current.copy(phase = phase, result = result))
+            replaceStateLocked(current.copy(phase = phase, result = result,
+                checkingStatus = phase == PrintWorkPhase.ACCEPTED))
+        }
+        notifyObserver()
+        if (result.accepted) checkJobStatus(id)
+    }
+
+    /** Only reads the latest submitted job. Unknown states never trigger another submission. */
+    fun checkJobStatus(id: Long) {
+        synchronized(lock) {
+            val current = state ?: return
+            if (current.requestId != id || current.phase != PrintWorkPhase.ACCEPTED || current.jobStatus?.terminal == true) return
+            statusTask?.cancel(false)
+            val generation = ++statusGeneration
+            replaceStateLocked(current.copy(checkingStatus = true, statusError = null))
+            val started = System.nanoTime()
+            statusTask = statusWorker.schedule({ pollJob(id, generation, started, 0) }, 0, TimeUnit.SECONDS)
+        }
+        notifyObserver()
+    }
+
+    private fun pollJob(id: Long, generation: Long, started: Long, previousFailures: Int) {
+        val current = synchronized(lock) {
+            state?.takeIf { it.requestId == id && statusGeneration == generation && it.phase == PrintWorkPhase.ACCEPTED }
+        } ?: return
+        val result = runCatching {
+            IppClient.getJobStatus(current.request.printer.endpoint, current.result?.jobId, current.result?.jobUri)
+        }
+        synchronized(lock) {
+            val latest = state ?: return
+            if (latest.requestId != id || statusGeneration != generation || latest.phase != PrintWorkPhase.ACCEPTED) return
+            val status = result.getOrNull() ?: latest.jobStatus
+            val failures = if (result.isSuccess) 0 else previousFailures + 1
+            val timedOut = System.nanoTime() - started >= TimeUnit.MINUTES.toNanos(5)
+            val keepChecking = status?.terminal != true && failures < 3 && !timedOut
+            val error = when {
+                status?.terminal == true || keepChecking -> null
+                timedOut -> "상태 확인 시간이 지났습니다. 필요하면 상태를 다시 확인하세요."
+                else -> result.exceptionOrNull()?.message ?: "프린터에서 출력 결과를 확인하지 못했습니다"
+            }
+            replaceStateLocked(latest.copy(jobStatus = status, checkingStatus = keepChecking, statusError = error))
+            if (status?.terminal == true) journal?.edit()?.putString("phase", "PRINTER_FINISHED")?.apply()
+            if (keepChecking) {
+                statusTask = statusWorker.schedule({ pollJob(id, generation, started, failures) }, 2, TimeUnit.SECONDS)
+            }
         }
         notifyObserver()
     }

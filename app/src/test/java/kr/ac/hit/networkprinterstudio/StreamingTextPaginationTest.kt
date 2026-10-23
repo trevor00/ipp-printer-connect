@@ -43,6 +43,18 @@ class StreamingTextPaginationTest {
         assertEquals(count, emittedPages)
     }
 
+    @Test fun explicitPageLimitStopsParsingAndEmittingAtTheRequestedLastPage() {
+        val text = "a\n".repeat(100_000)
+        val reader = CountingReader(text)
+        val pages = mutableListOf<List<String>>()
+        val count = StreamingTextPagination.forEachPage(
+            reader, 10f, 20f, 0f, 10f, 10f, { it.length.toFloat() }, maxPages = 3,
+        ) { pages.add(it) }
+        assertEquals(3, count)
+        assertEquals(3, pages.size)
+        assertTrue("page-range parsing should stop before EOF", reader.consumed < text.length)
+    }
+
     @Test fun invalidSurrogatesFailInsteadOfDroppingCharacters() {
         for (text in listOf("a\uD83D", "\uDE00", "\uD83Da")) {
             val result = runCatching { StreamingTextPagination.forEachPage(ChunkReader(text, 1), 10f, 50f, 0f, 10f, 10f, { it.length.toFloat() }) {} }
@@ -88,6 +100,19 @@ class StreamingTextPaginationTest {
             val count = minOf(chunk, length, text.length - cursor)
             text.toCharArray(destination, offset, cursor, cursor + count)
             cursor += count
+            return count
+        }
+        override fun close() = Unit
+    }
+
+    private class CountingReader(private val text: String) : Reader() {
+        var consumed = 0
+            private set
+        override fun read(destination: CharArray, offset: Int, length: Int): Int {
+            if (consumed == text.length) return -1
+            val count = minOf(length, text.length - consumed)
+            text.toCharArray(destination, offset, consumed, consumed + count)
+            consumed += count
             return count
         }
         override fun close() = Unit

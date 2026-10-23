@@ -14,11 +14,31 @@ import com.tom_roush.pdfbox.util.Matrix
 import com.tom_roush.harmony.awt.geom.AffineTransform
 import java.io.File
 import java.util.concurrent.CancellationException
+import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.sqrt
 
 /** Page selection and placement keep PDF content streams, fonts and image samples. */
 internal object PdfPageEditor {
+    fun needsSelectedPaperFit(source: File, options: ContentLayoutOptions, ranges: List<IppRange>, cacheDir: File): Boolean {
+        if (options.pageWidth <= 1 || options.pageHeight <= 1) return false
+        val memory = MemoryUsageSetting.setupTempFileOnly().setTempDir(cacheDir)
+        PDDocument.load(source, memory).use { input ->
+            require(input.numberOfPages > 0) { "PDF에 출력할 페이지가 없습니다" }
+            val indexes = selectedPages(input.numberOfPages, ranges).toList()
+            return indexes.any { index ->
+                val page = input.getPage(index)
+                val box = page.cropBox
+                val rotation = ((page.rotation % 360) + 360) % 360
+                require(rotation % 90 == 0) { "PDF 페이지 회전값을 처리할 수 없습니다" }
+                val unit = page.userUnit
+                val sourceWidth = (if (rotation == 90 || rotation == 270) box.height else box.width) * unit
+                val sourceHeight = (if (rotation == 90 || rotation == 270) box.width else box.height) * unit
+                abs(sourceWidth - options.pageWidth) > 2f || abs(sourceHeight - options.pageHeight) > 2f
+            }
+        }
+    }
+
     fun write(source: File, destination: File, settings: FilePreparationSettings, cacheDir: File) {
         val memory = MemoryUsageSetting.setupTempFileOnly().setTempDir(cacheDir)
         PDDocument.load(source, memory).use { input ->
@@ -66,7 +86,7 @@ internal object PdfPageEditor {
                             if (!iterator.hasNext()) break
                             val page = input.getPage(iterator.next())
                             require(page.annotations.isEmpty()) {
-                                "주석·입력란이 있는 PDF는 현재 배치 변경을 지원하지 않습니다. 주석을 포함해 평면화한 PDF를 선택하거나 원본 배치로 인쇄하세요."
+                                "주석·입력란이 있는 PDF를 선택 용지에 맞추려면 주석과 입력란을 포함해 평면화한 PDF가 필요합니다. 프린터가 PDF를 직접 지원하고 원본 크기로 인쇄하면 이 변환을 피할 수 있습니다."
                             }
                             require(page.userUnit == 1f) { "특수 좌표 단위 PDF는 배치 변경을 지원하지 않습니다. 원본 배치로 인쇄하세요." }
                             val box = page.cropBox
